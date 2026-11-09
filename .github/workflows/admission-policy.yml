@@ -29,11 +29,11 @@ jobs:
           from pathlib import Path
           from urllib.request import Request, urlopen
 
-          url = "https://api.github.com/repos/2233admin/code-intel-pipeline/issues/comments/6095718178"
+          url = "https://api.github.com/repos/XartLab/code-intel-pipeline/issues/comments/6095718178"
           request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "code-intel-admission-policy-ci", "Authorization": "Bearer " + os.environ["GH_TOKEN"]})
           with urlopen(request, timeout=30) as response:
               receipt = json.load(response)
-          if receipt["user"]["login"] != "2233admin" or receipt["html_url"] != "https://github.com/2233admin/code-intel-pipeline/issues/427#issuecomment-6095718178":
+          if receipt["user"]["login"] != "2233admin" or receipt["html_url"] != "https://github.com/XartLab/code-intel-pipeline/issues/427#issuecomment-6095718178":
               raise SystemExit("policy receipt is not the independently recorded owner approval")
           expected = {}
           for line in receipt["body"].splitlines():
