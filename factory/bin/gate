@@ -29,6 +29,12 @@ from the main checkout's config.json too:
   line outside them that starts with its only `<command>`): each runs with `bash -e -o pipefail -c` after the path checks, in the worktree; a non-zero exit or fail_patterns hit is FAIL (correctness), and checks.md shows
   the command, its exit and output tail. One that names holdout/ is left to the holdout acceptance.
 - signoff: when true, FAIL unless every commit in base..HEAD has Signed-off-by.
+- Skip and focus markers (MARKERS: pytest/unittest skip and xfail, `.skip(` / `.only(` / `.todo(`, fit, xit,
+  `#[ignore]`, t.Skip, @Disabled ...): a line the branch adds with one, outside *.md/*.rst/*.txt, is FAIL
+  (test-weak); markers already on the base are left alone.
+- The gate's own errors (a file it reads is invalid, a tool is missing, git fails, including fetching
+  origin/<base>, or a crash) are GATE: FAIL with REASON: env in checks.md (merge-checks.md), exit 1;
+  without a build round to write into, exit 2. Never a pass.
 - tools.json: every `kind: "script"` tool whose `stages` include "gate" (and whose
   `surfaces`, when set, meet the job's) runs after the path checks, in the
   worktree, output in round-N/tools/<name>.log. A failure is FAIL (correctness)
@@ -90,12 +96,13 @@ When checks.sh fails, the gate runs it again on a worktree of origin/<base>
 verdict is GATE: BASE-RED: the base is broken, not the branch.
 
 A verdict other than PASS carries a `REASON:` header line (config.json reasons):
-base-red, else protected-path, else signoff, else test-weak (R1, the holdout or
-a surviving mutant), else flaky, else env (ft.setup failed in the holdout's HEAD
+base-red, else protected-path, else signoff, else test-weak (a new skip/focus marker, R1, the
+holdout or a surviving mutant), else flaky, else env (ft.setup failed in the holdout's HEAD
 worktree), else complexity, else duplication, else correctness (checks.sh,
 fail_patterns, a path check, a blocking script tool or the holdout failed).
 """
 
+import ast
 import contextlib
 import fcntl
 import fnmatch
@@ -112,24 +119,32 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 REPO = Path(__file__).resolve().parents[2]
 FACTORY = REPO / "factory"
 JOBS = FACTORY / "jobs"
-CONFIG = json.loads((FACTORY / "config.json").read_text())
+STARTUP_ERROR = None  # set when config.json or factory/tools/ft can't be loaded; `gate <job>` turns it into FAIL
+try:
+    CONFIG = json.loads((FACTORY / "config.json").read_text())
+    BASE = CONFIG["base_branch"]
+except (OSError, ValueError, KeyError, TypeError) as e:
+    CONFIG, BASE, STARTUP_ERROR = {}, "main", f"factory/config.json can't be read: {e!r}"
 CHECKS = FACTORY / "checks.sh"
 TOOLS = FACTORY / "tools.json"
 FT = FACTORY / "tools" / "ft"
-BASE = CONFIG["base_branch"]
 TAIL = 80
 SECRETS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 
 
+class GateError(Exception):
+    """The gate itself couldn't do its job (a tool, a file it reads, git): FAIL with REASON env, never a pass."""
+
+
 def die(msg):
-    print(f"gate: {msg}", file=sys.stderr)
-    sys.exit(2)
+    raise GateError(msg)
 
 
 def git(worktree, *args, check=True):
@@ -176,6 +191,36 @@ def runs_holdout(cmd):
     return False
 
 
+# Skip and focus markers of the common test frameworks; a line the branch adds with one is FAIL (test-weak).
+MARKERS = re.compile(
+    r"\bpytest\.mark\.(?:skip|skipif|xfail)\b|\bpytest\.(?:skip|xfail|importorskip)\("
+    r"|@unittest\.(?:skip\w*|expectedFailure)\b|\bunittest\.SkipTest\b|\.skipTest\("
+    r"|\b(?:it|test|describe|context|suite)(?:\.\w+)*\.(?:skip|skipIf|only|todo)\b"
+    r"|(?<![\w.$])(?<!def )(?<!function )(?:fit|fdescribe|xit|xdescribe|xtest)\s*\("
+    r"|#\[ignore\b[^\]]*\]|\b[tb]\.Skip(?:Now|f)?\(|@(?:Disabled|Ignore)\b")
+DOCS = ("*.md", "*.rst", "*.txt")
+
+
+def new_markers(worktree):
+    """[(path:line, text)] of lines the branch adds that carry a skip or focus marker (docs aside)."""
+    out, path, line = [], None, 0
+    diff = git(worktree, "-c", "core.quotePath=false", "diff", "-U0", "--no-color", "--no-ext-diff",
+               "--src-prefix=a/", "--dst-prefix=b/", f"origin/{BASE}...HEAD")  # whatever diff.noprefix says
+    for l in diff.splitlines():
+        if l.startswith("+++ "):
+            name = l[4:]
+            if name.startswith('"'):  # a path with quotes, backslashes or control characters, C-quoted
+                name = ast.literal_eval(name)
+            path = name[2:] if name.startswith("b/") else None
+        elif l.startswith("@@"):
+            line = int(re.match(r"@@ -\S+ \+(\d+)", l).group(1))
+        elif l.startswith("+") and path:
+            if MARKERS.search(l[1:]) and not any(fnmatch.fnmatch(path, d) for d in DOCS):
+                out.append((f"{path}:{line}", l[1:].strip()))
+            line += 1
+    return out
+
+
 def unsigned_commits(worktree):
     if not CONFIG.get("signoff"):
         return []
@@ -197,29 +242,43 @@ def load_ft():
 
 
 sys.dont_write_bytecode = True  # loading ft must not leave factory/tools/__pycache__/ in the checkout
-FTM = load_ft()
-slot_count = FTM.slot_count
+try:
+    FTM = load_ft()
+    slot_count = FTM.slot_count
+except Exception as e:  # noqa: BLE001  ft reads config.json too; the gate must still be able to say FAIL
+    FTM, slot_count = None, lambda: 1
+    STARTUP_ERROR = STARTUP_ERROR or f"factory/tools/ft can't be loaded: {e!r}"
 
 
 class Slot:
-    """A file lock among config.json gate_slots; waits while every slot is taken."""
+    """The gate lock (Nightshift #14): one gate at a time on this checkout, whatever gate_slots says, since parallel
+    checks.sh runs trampled each other in the target repo (ETXTBSY). Waits while another gate holds it."""
 
     def __enter__(self):
         JOBS.mkdir(parents=True, exist_ok=True)
-        slots = slot_count()
-        while True:
-            for i in range(slots):
-                f = open(JOBS / f".gate-slot-{i}.lock", "w")
-                try:
-                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self.f = f
-                    return self
-                except BlockingIOError:
-                    f.close()
-            time.sleep(1)
+        self.f = open(JOBS / ".gate.lock", "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
 
     def __exit__(self, *exc):
         self.f.close()
+
+
+# Free-disk floor before a gate runs anything (Nightshift #14). 依据: code-intel 2026-11-02 实测单个 worktree 的
+# target/ 5–8 GB, 再留一份基线的余量; 待定, #14 落地后 job metrics 记每单峰值磁盘, 20 单后复核.
+# FACTORY_GATE_MIN_FREE_GB overrides it (the tests set it).
+MIN_FREE_GB = 10
+# Base-run output that says the machine, not the base, failed: never cached as `.base-<sha>.json` (Nightshift #14).
+ENV_ERRORS = re.compile(r"ENOSPC|No space left|ETXTBSY|Resource temporarily unavailable")
+
+
+def disk_floor(path):
+    """Refuse (GateError → FAIL, REASON env) when the disk holding `path` has less free space than the floor."""
+    floor = float(os.environ.get("FACTORY_GATE_MIN_FREE_GB", MIN_FREE_GB))
+    free = shutil.disk_usage(path).free / 1e9
+    if free < floor:
+        die(f"only {free:.1f} GB free on the disk of {path} (floor {floor:g} GB): free space, then run the gate "
+            "again; nothing was run or cached")
 
 
 def clean_env(empty_dir):
@@ -311,7 +370,7 @@ def remember_pass(job_id, commit, base, label, log, seconds):
 
 
 def base_sha(worktree):
-    git(worktree, "fetch", "origin", BASE, check=False)
+    git(worktree, "fetch", "origin", BASE)  # a stale origin/<base> would judge against the wrong base
     return git(worktree, "rev-parse", f"origin/{BASE}").strip()
 
 
@@ -335,8 +394,12 @@ def base_red(worktree, argv=None, label="checks.sh"):
     if cache.exists():
         return sha, json.loads(cache.read_text())["red"]
     with base_tree(sha) as tree:
-        code, _, _, hit = run_checks(tree, argv)
+        code, log, _, hit = run_checks(tree, argv)
     red = code != 0 or hit is not None
+    env = ENV_ERRORS.search(log) if red else None
+    if env:
+        tail = "\n".join(log.rstrip().splitlines()[-20:])
+        die(f"the base run hit an environment error ({env.group(0)}), not cached as BASE-RED:\n{tail}")
     cache.write_text(json.dumps({"red": red, "exit": code, "fail_pattern": hit}) + "\n")
     return sha, red
 
@@ -790,12 +853,13 @@ def gate_inputs(job_id):
     commit = git(worktree, "rev-parse", "HEAD").strip()
     protected = protected_changes(worktree, job.get("allowed_tests") or []) + holdout_tampered(job)
     unsigned = unsigned_commits(worktree)
+    markers = new_markers(worktree)
     changed = changed_files(worktree)
     extra = [c for c in CONFIG.get("path_checks", [])
              if any(fnmatch.fnmatch(f, p) for f in changed for p in c["paths"])]
     base = base_sha(worktree)
     return {"job": job, "worktree": worktree, "round_dir": round_dir, "commit": commit, "protected": protected,
-            "unsigned": unsigned, "changed": changed, "extra": extra, "base": base}
+            "unsigned": unsigned, "markers": markers, "changed": changed, "extra": extra, "base": base}
 
 
 def gate_run_checks(job_id, s):
@@ -825,7 +889,7 @@ def gate_run_checks(job_id, s):
     tool_results = run_tools(s["job"], worktree, s["round_dir"])
     tool_red = [t for t in tool_results if t[1] != 0 or t[3]]
     checks_red = code != 0 or hit is not None
-    others_red = bool(s["protected"] or s["unsigned"] or any(r[1] != 0 or r[3] for r in path_results)
+    others_red = bool(s["protected"] or s["unsigned"] or s["markers"] or any(r[1] != 0 or r[3] for r in path_results)
                       or spec_red or any(t[4] for t in tool_red))
     verdict = "PASS" if not checks_red and not others_red else "FAIL"
     red_base = None
@@ -866,7 +930,7 @@ def gate_reason(s):
     verdict, held, sat, qual = s["verdict"], s["held"], s["sat"], s["qual"]
     return None if verdict == "PASS" else "base-red" if verdict == "BASE-RED" else (
         "protected-path" if s["protected"] else "signoff" if s["unsigned"]
-        else "test-weak" if s["weak"] or held == "weak" or (qual and qual["survivors"])
+        else "test-weak" if s["markers"] or s["weak"] or held == "weak" or (qual and qual["survivors"])
         else "flaky" if sat and sat["flaky"] else "env" if held == "error"
         else "complexity" if qual and qual["complexity"] else "duplication" if qual and qual["duplication"]
         else "correctness")
@@ -885,6 +949,7 @@ def gate_text_head(s, reason):
     if CONFIG.get("signoff"):
         text += "## Sign-off\n" + bullets([f"{c} has no Signed-off-by" for c in s["unsigned"]],
                                           "Every commit is signed off.") + "\n\n"
+    text += "## Skip / focus markers\n" + bullets([f"`{w}`: `{t}`" for w, t in s["markers"]], "None added.") + "\n\n"
     text += "## Fail patterns\n" + (f"Matched: `{hit}`" if hit else "None matched.") + "\n\n"
     text += "## Path checks\n" + bullets(
         [f"`{r}`: exit {c} in {t}s" + (f", matched `{h}`" if h else "") for r, c, t, h in s["path_results"]],
@@ -945,6 +1010,7 @@ def gate_notes(s):
         notes.append(f"protected paths changed: {', '.join(s['protected'])}")
     if s["unsigned"]:
         notes.append(f"not signed off: {', '.join(s['unsigned'])}")
+    notes += [f"skip/focus marker added: {w}" for w, _ in s["markers"]]
     notes += [f"path check failed: {r}" for r, c, _, h in s["path_results"] if c != 0 or h]
     notes += [f"spec command failed: {r[0]}" for r in s["spec_red"]]
     notes += [f"tool {n} failed" + ("" if b else " (not blocking)") for n, _, _, _, b in s["tool_red"]]
@@ -974,6 +1040,38 @@ def gate_result_notes(s):
 
 
 def gate(job_id, merge):
+    """The gate, or when it fails to run (GateError or a crash), checks.md GATE: FAIL with REASON: env."""
+    try:
+        run_gate(job_id, merge)
+    except GateError as e:
+        gate_failed(job_id, merge, str(e))
+    except Exception:  # noqa: BLE001  a crash is the gate's error too, not a pass
+        gate_failed(job_id, merge, traceback.format_exc().rstrip())
+
+
+def gate_failed(job_id, merge, why):
+    """Write the gate's own error as a FAIL (env) over whatever checks.md said before; exit 1."""
+    try:
+        job = json.loads((JOBS / job_id / "job.json").read_text())
+        round_dir = JOBS / job_id / f"round-{job['round']}"
+        commit = git(job["worktree"], "rev-parse", "HEAD").strip() if job["round"] >= 1 else None
+    except (OSError, ValueError, KeyError, TypeError, GateError):
+        commit = None
+    if not commit:  # no round to write into: still not a pass
+        print(f"gate: {why}", file=sys.stderr)
+        sys.exit(2)
+    name = "merge-checks" if merge else "checks"
+    round_dir.mkdir(parents=True, exist_ok=True)
+    (round_dir / f"{name}.md").write_text(f"GATE: FAIL\nCOMMIT: {commit}\nREASON: env\n\n## Gate error\n"
+                                          f"The gate itself failed, so nothing was judged:\n\n```\n{why}\n```\n")
+    first = why.strip().splitlines()[-1] if why.strip() else "?"
+    print(f"GATE: FAIL ({job_id} round {job['round']}, the gate itself failed: {first})")
+    sys.exit(1)
+
+
+def run_gate(job_id, merge):
+    if STARTUP_ERROR:
+        die(STARTUP_ERROR)
     s = gate_inputs(job_id)
     if merge:
         reused = reuse_for_merge(job_id, s["round_dir"], s["commit"], s["base"])
@@ -983,6 +1081,7 @@ def gate(job_id, merge):
     s["argv"], s["label"] = checks_argv(s["changed"])
 
     with Slot():
+        disk_floor(s["worktree"])  # inside the lock: the gate before this one may have used the disk up
         gate_run_checks(job_id, s)
         gate_followups(s, merge)
 
@@ -1063,6 +1162,7 @@ def hook():
     if clean and cached_pass(job_id, commit, base, label):
         sys.exit(0)
     with Slot():
+        disk_floor(wt)
         code, log, seconds, hit = run_checks(wt, argv)
     if code == 0 and not hit and clean:
         remember_pass(job_id, commit, base, label, log, seconds)
@@ -1091,8 +1191,10 @@ def at_commit(sha):
     else:
         if subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=REPO, check=False).returncode != 0:
             die(f"commit {sha[:7]} isn't in this checkout; git fetch origin {BASE} first")
-        with Slot(), base_tree(sha) as tree:
-            code, log, seconds, hit = run_checks(tree)
+        with Slot():
+            disk_floor(REPO)
+            with base_tree(sha) as tree:
+                code, log, seconds, hit = run_checks(tree)
         runs.mkdir(parents=True, exist_ok=True)
         (runs / f"{sha}.log").write_text(log)
         r = {"sha": sha, "red": code != 0 or hit is not None, "exit": code, "seconds": seconds,
@@ -1119,4 +1221,8 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        main(sys.argv[1:])
+    except GateError as e:  # outside a job's gate run (usage, --at, the hook): no checks.md to write into
+        print(f"gate: {e}", file=sys.stderr)
+        sys.exit(2)

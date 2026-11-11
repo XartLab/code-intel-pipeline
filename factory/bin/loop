@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""The factory's resident loop: no model, no judgement; models only run inside the workers it starts.
+
+Usage: loop <repo-checkout> [--backend orca|print] [--agent <host>] [--interval 120] [--once] [--slots 3]
+
+Each round: `job queue`; for a `new` issue while fewer than --slots jobs are in flight, `job create`; for every
+in-flight job (`resume`, `stalled`) `job drive`; every `DISPATCH` it prints goes to the backend, which starts a
+worker for it; then wait (orca: `orca orchestration check --wait`, else sleep) for the next round. A `STOP` is a line
+in the log: a person is next. One loop per repository.
+
+Backends:
+  orca   `orca orchestration worker-start --spec-file - --agent <host> --model <m> --worktree <selector> --json`
+         with the role's prompt file (.claude/agents/<role>.md without its frontmatter), a blank line and the
+         DISPATCH's prompt on stdin. The receipt's dispatchId and launch.effective go to
+         factory/jobs/<job>/dispatch.jsonl (a local cache). Output with "usage limit" or "429" ends the starting
+         for the round (the next round tries again). A worker that fails is only logged: the file it should have
+         written stays missing, so `job queue` calls the job stalled and the next round starts the role again, or
+         `job` makes it needs-human.
+  print  prints each DISPATCH, starts nothing.
+
+Which backend, and which host (the agent CLI Orca starts for a worker), are the project's: --backend and --agent, else
+`backend` and `agent` in the `loop` section of factory/config.json; with neither the loop exits 2 and says what to
+add. A DISPATCH whose model is `<host>:<model>` with host listed in the section's `hosts` runs that role on that host
+with `--model <model>`, so config.json routing can put roles on different hosts; any other model, colon or not, is
+passed whole. No product name is a constant here: the template config.json carries the usual ones.
+
+A DISPATCH already started (same job, role, model and prompt, in dispatch.jsonl, since the job last entered its
+stage) isn't started twice, except for a job `job queue` calls stalled. One a usage limit stopped is kept in the job
+folder's pending.jsonl and tried again first thing in every round. Each round writes factory/jobs/.loop-heartbeat (a UTC timestamp).
+
+An unexpected error in one job (a record file cut off mid-line, say) is an `ERROR` line for that job; the jobs after it
+are still driven. One that fails the whole round is an `ERROR round` line and no heartbeat: the next round tries
+again (--once exits 1). Nothing is repaired: a person reads the log.
+"""
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+QUOTA = re.compile(r"usage limit|\b429\b", re.IGNORECASE)
+BACKENDS = ("orca", "print")  # the adapters this file implements; which one runs is the project's config
+MIN_ROUND_SECONDS = 10  # a `check --wait` that returns at once must not turn the loop into a busy loop
+SETTLED = {"needs-info", "needs-human", "rejected", "merged"}
+
+
+def now():
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(msg):
+    print(f"loop {now()} {msg}", flush=True)
+
+
+class Loop:
+    def __init__(self, repo, backend, interval, slots, agent, hosts=()):
+        self.repo = Path(repo).resolve()
+        self.factory = self.repo / "factory"
+        self.jobs = self.factory / "jobs"
+        self.backend, self.interval, self.slots, self.agent = backend, interval, slots, agent
+        self.hosts = set(hosts)  # the `<host>:` prefixes a routed model may carry; anything else is model text
+        self.quota = False  # a worker start was refused for usage this round
+
+    # ---- the job script ----
+    def job(self, *args):
+        return subprocess.run([sys.executable, str(self.factory / "bin" / "job"), *args], cwd=self.repo,
+                              capture_output=True, text=True, check=False)
+
+    def job_json(self, job_id):
+        return json.loads((self.jobs / job_id / "job.json").read_text())
+
+    # ---- one round ----
+    def queue(self):
+        res = self.job("queue")
+        if res.returncode:
+            log(f"ERROR job queue: {(res.stderr or res.stdout).strip()}")
+            return []
+        return [line.split("\t") for line in res.stdout.splitlines() if line.count("\t") >= 4]
+
+    def round(self):
+        self.quota = False
+        if self.backend == "orca":
+            self.retry_pending()
+        rows = self.queue()
+        flying = [(r[2], r[0] == "stalled") for r in rows if r[0] in {"resume", "stalled"} and r[2] != "-"]
+        for action, issue, *_ in rows:
+            if action != "new" or len(flying) >= self.slots:
+                continue
+            res = self.job("create", issue)
+            if res.returncode:
+                log(f"#{issue} not started: {(res.stderr or res.stdout).strip().removeprefix('job: ')}")
+                continue
+            flying.append((res.stdout.strip(), False))
+            log(f"#{issue} job {res.stdout.strip()} created")
+        for job_id, stalled in flying:
+            try:
+                self.drive(job_id, stalled)
+            except Exception as exc:  # noqa: BLE001  one job's broken files must not stop the jobs after it (#116)
+                log(f"{job_id} ERROR {type(exc).__name__}: {exc}")
+        self.heartbeat()
+
+    def heartbeat(self):
+        self.jobs.mkdir(parents=True, exist_ok=True)
+        (self.jobs / ".loop-heartbeat").write_text(now() + "\n")
+
+    def drive(self, job_id, stalled):
+        res = self.job("drive", job_id)
+        out = res.stdout.strip()
+        if res.returncode or not out:
+            log(f"{job_id} ERROR {out or res.stderr.strip()}")
+            return
+        first = out.splitlines()[0]
+        if first.startswith("DISPATCH "):
+            for role, model, prompt in dispatches(out):
+                self.start(job_id, role, model, prompt, force=stalled)
+        elif first.startswith("WAIT ") and stalled:  # nothing new to start, but the roles it waits on went quiet
+            _, _, *roles = first.split()
+            for role in roles:
+                self.restart(job_id, role)
+        else:
+            log(f"{job_id} {first}")
+
+    def restart(self, job_id, role):
+        """A stalled job whose dispatched role never wrote its file: its standard prompt again, in a new worker."""
+        res = self.job("prompt", job_id, role)
+        if res.returncode:
+            log(f"{job_id} ERROR job prompt {role}: {(res.stderr or res.stdout).strip()}")
+            return
+        job = self.job_json(job_id)
+        agents = job.get("agents") or {}
+        model = (agents.get("builder") if role == "builder" else
+                 (agents.get("reviewers") or {}).get(role.removeprefix("reviewer-")) if role.startswith("reviewer-")
+                 else job.get("intake_model") if role == "intake" else None) or self.frontmatter_model(role)
+        self.start(job_id, role, model, res.stdout.strip().splitlines(), force=True)
+
+    # ---- roles ----
+    def role_file(self, role):
+        return self.repo / ".claude" / "agents" / f"{role}.md"
+
+    def frontmatter_model(self, role):
+        path = self.role_file(role)
+        m = re.search(r"^model:\s*(\S+)", path.read_text(), re.MULTILINE) if path.exists() else None
+        return m.group(1) if m else None
+
+    def role_body(self, role):
+        path = self.role_file(role)
+        if not path.exists():
+            return None
+        text = path.read_text()
+        return (text.split("---\n", 2)[2] if text.startswith("---\n") and text.count("---\n") >= 2 else text).strip()
+
+    # ---- backends ----
+    def entry(self, job_id):
+        """Index in events.jsonl of the last transition into the job's current stage (`job entered`), None without
+        one: a dispatch belongs to one stay in a stage, so a job back in intake after needs-info starts intake again."""
+        res = self.job("entered", job_id)
+        head = res.stdout.split("\t")[0].strip()
+        return int(head) if res.returncode == 0 and head.isdigit() else None
+
+    def records(self, job_id, name):
+        path = self.jobs / job_id / name
+        return [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.exists() else []
+
+    def write_records(self, job_id, name, rows):
+        path = self.jobs / job_id / name
+        if rows:
+            path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        elif path.exists():
+            path.unlink()
+
+    def start(self, job_id, role, model, prompt, force=False):
+        text = "\n".join(prompt)
+        if self.backend == "print":
+            print(f"DISPATCH {job_id} {role} {model}\n{text}\n", flush=True)
+            return
+        key = hashlib.sha256(f"{role}\n{model}\n{text}".encode()).hexdigest()
+        entry = self.entry(job_id)
+        if not force and entry is not None and any(
+                s.get("key") == key and s.get("entry") == entry for s in self.records(job_id, "dispatch.jsonl")):
+            return
+        if any(p.get("key") == key and p.get("entry") == entry for p in self.records(job_id, "pending.jsonl")):
+            return  # refused for usage earlier: retried at the start of every round
+        if self.launch(job_id, role, model, text, key, entry) == "quota":
+            with (self.jobs / job_id / "pending.jsonl").open("a") as f:
+                f.write(json.dumps({"ts": now(), "role": role, "model": model, "prompt": text, "key": key,
+                                    "entry": entry}) + "\n")
+
+    def retry_pending(self):
+        """Dispatches a usage limit stopped: first in every round, before drive. Still limited: they stay."""
+        if not self.jobs.exists():
+            return
+        for path in sorted(self.jobs.glob("*/pending.jsonl")):
+            job_id = path.parent.name
+            keep, current = [], self.entry(job_id)
+            for p in self.records(job_id, "pending.jsonl"):
+                if p.get("entry") != current:  # the job moved on: this dispatch is stale
+                    continue
+                if self.quota or self.launch(job_id, p["role"], p["model"], p["prompt"], p["key"], current) == "quota":
+                    keep.append(p)
+            self.write_records(job_id, "pending.jsonl", keep)
+
+    def launch(self, job_id, role, model, text, key, entry):
+        """worker-start for one DISPATCH: 'ok' (recorded in dispatch.jsonl), 'quota' (usage limit) or 'failed'."""
+        if self.quota:
+            log(f"{job_id} {role} not started: usage limit earlier this round")
+            return "quota"
+        body = self.role_body(role)
+        if body is None:
+            log(f"{job_id} {role} not started: no .claude/agents/{role}.md")
+            return "failed"
+        job = self.job_json(job_id)
+        where = job["worktree"] if Path(job["worktree"]).exists() else str(self.repo)
+        agent, host_model = self.host(model)
+        cmd = ["orca", "orchestration", "worker-start", "--spec-file", "-", "--agent", agent,
+               *(["--model", host_model] if host_model else []), "--worktree", f"path:{where}", "--json"]
+        res = subprocess.run(
+            cmd, cwd=self.repo, input=f"{body}\n\n{text}\n", capture_output=True, text=True, check=False)
+        said = (res.stdout or "") + (res.stderr or "")
+        if QUOTA.search(said):
+            self.quota = True
+            log(f"{job_id} {role} not started: usage limit ({said.strip()[:200]})")
+            return "quota"
+        if res.returncode:
+            log(f"{job_id} {role} not started: orca exited {res.returncode}: {said.strip()[:200]}")
+            return "failed"
+        try:
+            receipt = json.loads(res.stdout)
+        except ValueError:
+            receipt = {}
+        receipt = receipt if isinstance(receipt, dict) else {}
+        with (self.jobs / job_id / "dispatch.jsonl").open("a") as f:
+            f.write(json.dumps({"ts": now(), "role": role, "model": model, "agent": agent, "key": key,
+                                "entry": entry, "dispatchId": receipt.get("dispatchId"),
+                                "launch": (receipt.get("launch") or {}).get("effective")}) + "\n")
+        log(f"{job_id} {role} started on {agent} {host_model}")
+        return "ok"
+
+    def host(self, model):
+        """(agent, model) for a DISPATCH's model: a `<host>:` prefix the config lists picks the host, else the agent."""
+        head, sep, rest = (model or "").partition(":")
+        return (head, rest) if sep and head in self.hosts and rest else (self.agent, model)
+
+    def wait(self):
+        started = time.monotonic()
+        if self.backend == "orca":
+            res = subprocess.run(["orca", "orchestration", "check", "--wait", "--timeout-ms",
+                                  str(self.interval * 1000), "--json"],
+                                 cwd=self.repo, capture_output=True, text=True, check=False)
+            if res.returncode:
+                log(f"orca check --wait exited {res.returncode}: {(res.stderr or res.stdout).strip()[:200]}")
+            floor = MIN_ROUND_SECONDS if not res.returncode else self.interval
+        else:
+            floor = self.interval
+        time.sleep(max(0.0, floor - (time.monotonic() - started)))
+
+
+def dispatches(out):
+    """[(role, model, prompt lines)] of `job drive` output: a DISPATCH line and the lines after it up to a blank."""
+    found = []
+    for line in out.splitlines():
+        if line.startswith("DISPATCH "):
+            _, role, model = line.split()
+            found.append((role, model, []))
+        elif line.strip() and found:
+            found[-1][2].append(line)
+    return found
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description="The factory's resident loop.")
+    ap.add_argument("repo", help="the repository checkout the factory is installed in")
+    ap.add_argument("--backend", choices=BACKENDS, help="default: `backend` in config.json's `loop` section")
+    ap.add_argument("--agent", help="the agent CLI Orca starts for a worker unless its model says `<host>:<model>` "
+                                    "(default: `agent` in config.json's `loop` section)")
+    ap.add_argument("--interval", type=int, default=120, help="seconds between rounds (default 120)")
+    ap.add_argument("--once", action="store_true", help="one round, then exit")
+    ap.add_argument("--slots", type=int, default=3, help="jobs in flight at most (default 3)")
+    args = ap.parse_args(argv)
+    if not (Path(args.repo) / "factory" / "bin" / "job").is_file():
+        print(f"loop: {args.repo} has no factory/bin/job", file=sys.stderr)
+        return 1
+    cfg = json.loads((Path(args.repo) / "factory" / "config.json").read_text()).get("loop") or {}
+    backend, agent = args.backend or cfg.get("backend"), args.agent or cfg.get("agent")
+    missing = [k for k, v in (("backend", backend), ("agent", agent)) if not v]
+    if missing or backend not in BACKENDS:
+        what = f"no {' and no '.join(missing)}" if missing else f"backend {backend!r} isn't one of {', '.join(BACKENDS)}"
+        print(f'loop: {what}: give --backend and --agent, or add them to factory/config.json, e.g. '
+              f'"loop": {{"backend": "{BACKENDS[0]}", "agent": "<the agent CLI {BACKENDS[0]} starts>", "hosts": []}}',
+              file=sys.stderr)
+        return 2
+    loop = Loop(args.repo, backend, args.interval, args.slots, agent, cfg.get("hosts") or ())
+    try:
+        while True:
+            try:
+                loop.round()
+                failed = False
+            except Exception as exc:  # noqa: BLE001  a resident loop outlives a bad round: the next one tries again (#116)
+                log(f"ERROR round: {type(exc).__name__}: {exc}")
+                failed = True
+            if args.once:
+                return 1 if failed else 0
+            loop.wait()
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

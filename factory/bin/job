@@ -12,21 +12,35 @@ too: when the global issue search is unavailable (403 in cloud sessions) it list
 
 Usage:
   job doctor                     pre-flight checks and capability probe; /factory run stops on any FAIL
+  job init [--from <engine dir>] [--ref <ref>]
+                                 in a repo's root: install the factory, or update it when it's installed (idempotent).
+                                 Self-checks first (not native Windows, git, GitHub origin, full clone, gh login, push,
+                                 default branch, python 3.15, claude); creates the missing labels; copies the engine
+                                 files (factory/bin/*, factory/tools/*, .claude/agents/*, .claude/skills/factory/SKILL.md),
+                                 refusing when any has uncommitted changes; writes factory/checks.sh, config.json,
+                                 tools.json and docs/decisions/ only when missing; records the source commit in
+                                 config.json `engine`; then runs `job doctor` and exits with its status. The engine is
+                                 --from (a Nightshift checkout's engine/) or the XartLab/Nightshift tarball of --ref (main)
   job queue                      what /factory run should do with each labeled issue; `stalled` for a job
-                                 with no activity past config.json `stall_minutes` (a second time: needs-human)
+                                 with no activity past config.json `stall_minutes` (a second time: needs-human);
+                                 a job whose PR was merged on GitHub, at any stage, becomes merged
   job search <title>             open or closed issues whose title matches, before filing a new one
   job new-issue [--plan] <title> <file>
                                  file a `factory` issue (with --plan a `factory:plan` one) with <file> as its body;
                                  prints `<n> <url>`
   job create <issue>             new job for an open `factory` issue; prints the job id
   job advance <job> <stage>      move a job to <stage>, or refuse
-  job drive <job>                from build, gate, review or approve, run the steps that need no judgement
-                                 (advance, gate, evidence, sync, merge) up to the next agent or person; prints
+  job drive <job>                from any stage, run the steps that need no judgement (intake's route and advance,
+                                 the spec's advance, gate, evidence, sync, merge; a file refused once goes back to
+                                 its role with the refusal word for word, refused twice it is needs-human) up to
+                                 the next agent or person; prints
                                  `DISPATCH <role> <model>` + its prompt per agent (a builder continuation: the three
                                  header lines + the continuation); `WAIT <stage> <roles>` while dispatched agents
                                  haven't written their file (drive again when they return); or `STOP <stage> <why>`
                                  when a person or the orchestrator's judgement is next (a refusal word for word);
                                  `ERROR <command> <output>` and exit 1 when a step fails to run
+  job entered <job>              `<index> <tab> <time>` of the last transition into the job's current stage in events.jsonl,
+                                 or `none`; what a dispatch or a build.md has to be newer than to belong to this stay
   job merge <job>                APPROVE → sync with the base branch, gate, merge the PR at that commit;
                                  when the base moved meanwhile, sync and gate again (3 rounds at most); when
                                  required checks haven't finished on it, try again every 30s for 30 min at most
@@ -106,7 +120,7 @@ goes ahead and job.json records `holdout_blind_verified: false`.
 
 The read-only roles (只读): when a job enters review (gate → review) and approve (review → approve), `job` records the HEAD
 it was handed out at and a sha256 manifest of the job folder (job.json `read_only`; job.json, .lock,
-events.jsonl, refusals.jsonl, resources.json and *.tmp aren't listed). Leaving review (to approve, build or
+events.jsonl, refusals.jsonl, resources.json, dispatch.jsonl, pending.jsonl and *.tmp aren't listed). Leaving review (to approve, build or
 needs-human) or approve (to merging or needs-human) is refused, with every violation named, unless the worktree is
 clean (`git status --porcelain`), HEAD is still the recorded one, and the only files added, changed or deleted in the
 job folder are the stage's own: round N's coverage.md, review-<k>.md, proof/<k>/ of round N for a reviewer k of the job and the
@@ -119,22 +133,30 @@ gate → review on a job whose SURFACES include ui needs round-N/evidence/index.
 up to config.json evidence.allow_failed failed shots pass when spec.md marks each of them `(optional)`.
 """
 
-import fcntl
 import fnmatch
 import glob
 import hashlib
+import io
 import json
 import math
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote as urlquote
+
+try:
+    import fcntl
+except ModuleNotFoundError:  # native Windows: `job init` says so instead of a traceback
+    fcntl = None
 
 REPO = Path(__file__).resolve().parents[2]
 FACTORY = REPO / "factory"
@@ -154,15 +176,16 @@ TRANSITIONS = {
     "intake": {"needs-info", "rejected", "spec", "needs-human"},
     "needs-info": {"intake"},
     "spec": {"build", "needs-info", "needs-human"},
-    "build": {"gate", "needs-human"},
-    "gate": {"review", "build", "needs-human", "spec"},
-    "review": {"approve", "build", "needs-human"},
-    "approve": {"merging", "needs-human"},
+    "build": {"gate", "needs-human", "merged"},
+    "gate": {"review", "build", "needs-human", "spec", "merged"},
+    "review": {"approve", "build", "needs-human", "merged"},
+    "approve": {"merging", "needs-human", "merged"},
     "merging": {"merged", "needs-human"},
     "needs-human": {"build", "gate", "merged"},
 }
 TERMINAL = {"merged", "rejected"}
 WAITING = {"needs-info", "needs-human"}
+HAND_MERGEABLE = ("build", "gate", "review", "approve", "merging", "needs-human")  # stages whose job can have a PR
 STALL_DEFAULT = {"intake": 20, "spec": 40, "build": 90, "review": 40, "approve": 20}
 
 
@@ -179,8 +202,9 @@ def now():
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def run(cmd, cwd=REPO, check=True, stdin=None):
-    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, input=stdin, check=False)
+def run(cmd, cwd=None, check=True, stdin=None):
+    """cwd defaults to REPO as it is when called: `job init` points REPO at the repo it installs into."""
+    res = subprocess.run(cmd, cwd=REPO if cwd is None else cwd, capture_output=True, text=True, input=stdin, check=False)
     if check and res.returncode != 0:
         raise Refused(f"`{' '.join(cmd)}` failed: {(res.stderr or res.stdout).strip()}")
     return res
@@ -704,7 +728,7 @@ def evidence_missing(job, tool):
     return [g for g in tool["evidence"] if not list(d.glob(g.replace("{round}", str(job["round"]))))]
 
 
-SELF_KEPT = {"job.json", ".lock", "events.jsonl", "refusals.jsonl", "resources.json"}
+SELF_KEPT = {"job.json", ".lock", "events.jsonl", "refusals.jsonl", "resources.json", "dispatch.jsonl", "pending.jsonl"}
 
 
 def job_manifest(job):
@@ -782,10 +806,23 @@ def _read_only(job, stage, x):
                       + "\n- ".join(problems))
 
 
+def stage_entry(job):
+    """(index in events.jsonl, time) of the last transition into the job's current stage; None without one.
+    Whatever belongs to one stay in a stage (a dispatch, a build.md) is compared with it."""
+    events = read_events(job["id"])
+    hits = [i for i, e in enumerate(events) if e["to"] == job["stage"] and e["from"] != e["to"]]
+    return (hits[-1], parse_ts(events[hits[-1]]["ts"])) if hits else None
+
+
 def stage_entered(job):
     """When the job last entered its current stage, from events.jsonl (None without one)."""
-    entered = [e for e in read_events(job["id"]) if e["to"] == job["stage"] and e["from"] != e["to"]]
-    return parse_ts(entered[-1]["ts"]) if entered else None
+    entry = stage_entry(job)
+    return entry[1] if entry else None
+
+
+def cmd_entered(job):
+    entry = stage_entry(job)
+    print(f"{entry[0]}\t{entry[1].strftime('%Y-%m-%dT%H:%M:%SZ')}" if entry else "none")
 
 
 def check_tools(job, stage, roles):
@@ -1504,31 +1541,56 @@ def record_spec(job, path):
 
 
 def spec_commands(path):
-    """What the gate runs from `## 判定命令`: each fenced block (``` or ~~~) verbatim, as one bash script (-e,
-    pipefail), and each line outside them that starts with its only `<command>`. Refuses any other line outside the
-    blocks that has backticks, since the gate can't tell whether it names a command, and a block that runs holdout/
-    together with other commands, since the gate leaves that block to the holdout acceptance."""
+    """What the gate runs from `## 判定命令`, in document order: each fenced block (``` or ~~~) verbatim, as one bash
+    script (-e, pipefail), and each line outside them that starts with its only `<command>`. Refuses any other line
+    outside the blocks that has backticks, since the gate can't tell whether it names a command, and a block or line
+    that runs holdout/ together with other commands (more lines, or `&&` `||` `;` `|` `&` `|&` on one line), since the gate
+    leaves all of it to the holdout acceptance, which runs only the manifest."""
     text = section(path, "判定命令") or ""
     fence = re.compile(r"^[ \t]*(```|~~~)[^\n]*\n(.*?)^[ \t]*\1[ \t]*$", re.MULTILINE | re.DOTALL)
-    out = []
-    for m in fence.finditer(text):
-        body = m.group(2).rstrip("\n")  # verbatim: blank and `#` lines may be heredoc data, trailing spaces too
-        if any(l.strip() and not l.lstrip().startswith("#") for l in body.splitlines()):
-            out.append(body)
-    for line in fence.sub("", text).splitlines():
-        m = re.match(r"\s*(?:[-*]\s+|\d+\.\s+)?`([^`]+)`", line)
-        if m and "`" not in line[m.end():]:
-            out.append(m.group(1).strip())
-        else:
-            require("`" not in line, f"spec.md `## 判定命令`: can't tell whether this line names a command: {line.strip()!r}; "
-                                     "put commands in a ```bash block, or start the line with `<command>`")
+    out, at = [], 0
+    for m in [*fence.finditer(text), None]:
+        for line in text[at:m.start() if m else len(text)].splitlines():
+            c = re.match(r"\s*(?:[-*]\s+|\d+\.\s+)?`([^`]+)`", line)
+            if c and "`" not in line[c.end():]:
+                out.append(c.group(1).strip())
+            else:
+                require("`" not in line, f"spec.md `## 判定命令`: can't tell whether this line names a command: {line.strip()!r}; "
+                                         "put commands in a ```bash block, or start the line with `<command>`")
+        if m:
+            body = m.group(2).rstrip("\n")  # verbatim: blank and `#` lines may be heredoc data, trailing spaces too
+            if any(l.strip() and not l.lstrip().startswith("#") for l in body.splitlines()):
+                out.append(body)
+            at = m.end()
     runs_holdout = gate_module()["runs_holdout"]
     for cmd in out:
         lines = [l for l in cmd.splitlines() if l.strip() and not l.lstrip().startswith("#")]
-        require(not runs_holdout(cmd) or len(lines) == 1,
-                "spec.md `## 判定命令`: a block that runs holdout/ is left to the holdout acceptance, so the other "
-                f"commands in it wouldn't run; give the holdout command its own line: {lines[0]!r}")
+        require(not runs_holdout(cmd) or (len(lines) == 1 and not compound(lines[0])),
+                "spec.md `## 判定命令`: a block or line that runs holdout/ is left to the holdout acceptance, so the "
+                f"other commands in it wouldn't run; give the holdout command its own line: {lines[0]!r}")
     return out
+
+
+COMMAND_SEPARATORS = ("&&", "||", ";", "|", "&", "|&")  # `&`, `|&` start another command the same way
+
+
+def compound(line):
+    """Whether one shell line runs more than one command: `&&` `||` `;` `|` `&` `|&` with a command on both sides
+    (`pytest holdout;` alone is one)."""
+    try:
+        lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return any(op in line for op in COMMAND_SEPARATORS)
+    parts, cur = [], 0
+    for w in words:
+        if w in COMMAND_SEPARATORS:
+            parts.append(cur)
+            cur = 0
+        else:
+            cur += 1
+    return sum(1 for n in [*parts, cur] if n) > 1
 
 
 def allowed_tests(path):
@@ -1884,6 +1946,12 @@ def _human_to_merged(job, stage, x):
     require(pr_merged(job), "the PR isn't merged")
 
 
+def _merged_by_hand(job, stage, x):
+    """build, gate, review, approve → merged: only for a PR a person (or a merge bot) already merged on GitHub."""
+    require(pr_merged(job), f"{job['id']}: its PR isn't merged on GitHub; only `job merge` merges a job"
+            if job["pr"] else f"{job['id']} has no PR, so it isn't merged")
+
+
 def _human_to_gate(job, stage, x):
     require(last_gate(job) == "BASE-RED", "only a BASE-RED job goes back to the gate; use `job rework`")
     label(job["issue"], remove=LABELS["needs_human"])
@@ -1898,9 +1966,12 @@ def _human_to_build(job, stage, x):
     label(job["issue"], remove=LABELS["needs_human"])
 
 
-def _stall_only(job, stage, x):
-    require(False, f"{job['id']}: {x.old} → {stage} is only for a job that stalled twice; "
-                   "the queue does that")
+def _refused_twice(job, stage, x):
+    """intake/spec → needs-human, the way `job drive` ends a file its role wrote wrong twice (job.json `refusals`)."""
+    count = max(((job.get("refusals") or {}).get(x.old) or {"": 0}).values())
+    require(count >= 2, f"{job['id']}: {x.old} → {stage} is only for a job that stalled twice or whose file was "
+                        "refused twice; the queue and job drive do that")
+    x.reason = reasons_in(x.d / "decision.md")
 
 
 def _tail_needs_human(job, stage, x):
@@ -1914,6 +1985,27 @@ def _tail_needs_human(job, stage, x):
     else:
         comment(job["issue"], body)
     label(job["issue"], add=LABELS["needs_human"])
+
+
+BUILD_DIRS_DEFAULT = ["target", "node_modules/.cache"]
+
+
+def _tail_reclaim(job, stage, x):
+    """Nightshift #14: a job that stops (merged, rejected, needs-human) gives back config `build_dirs` in its
+    worktree (a cargo target/ is 5-8 GB); only relative paths inside the worktree, the rest stays for a human."""
+    if stage not in {"merged", "rejected", "needs-human"} or not job.get("worktree"):
+        return
+    wt = Path(job["worktree"]).resolve()
+    if not wt.is_dir():
+        return
+    dirs = CONFIG.get("build_dirs", BUILD_DIRS_DEFAULT) or []
+    for d in dirs if isinstance(dirs, list) else []:  # a bare string would be walked letter by letter
+        target = (wt / d).resolve()
+        if (not isinstance(d, str) or Path(d).is_absolute() or (wt / d).is_symlink() or target == wt
+                or wt not in target.parents or not target.is_dir()):
+            continue
+        shutil.rmtree(target, ignore_errors=True)
+        print(f"job: {job['id']}: reclaimed {d}", file=sys.stderr)
 
 
 def _tail_merged(job, stage, x):
@@ -1936,7 +2028,7 @@ def _tail_release(job, stage, x):
             print(f"job: {job['id']}: released {line}", file=sys.stderr)
 
 
-TAIL_STEPS = [_tail_needs_human, _tail_merged, _tail_release]
+TAIL_STEPS = [_tail_needs_human, _tail_reclaim, _tail_merged, _tail_release]
 
 # (from, to) → the steps that check the move and do its side effects, in order.
 STEPS = {
@@ -1946,8 +2038,8 @@ STEPS = {
     ("needs-info", "intake"): [_reintake],
     ("spec", "needs-info"): [_spec_questions],
     ("spec", "build"): [_spec_accepted],
-    ("intake", "needs-human"): [_stall_only],
-    ("spec", "needs-human"): [_stall_only],
+    ("intake", "needs-human"): [_refused_twice],
+    ("spec", "needs-human"): [_refused_twice],
     ("build", "gate"): [_build_ready],
     ("build", "needs-human"): [_build_blocked],
     ("gate", "review"): [_gate_fresh, _gate_to_review],
@@ -1964,6 +2056,10 @@ STEPS = {
     ("needs-human", "build"): [_human_to_build],
     ("needs-human", "gate"): [_human_to_gate],
     ("needs-human", "merged"): [_human_to_merged],
+    ("build", "merged"): [_merged_by_hand],
+    ("gate", "merged"): [_merged_by_hand],
+    ("review", "merged"): [_merged_by_hand],
+    ("approve", "merged"): [_merged_by_hand],
 }
 
 
@@ -2027,13 +2123,25 @@ WILL_CHANGE = "会改的文件"
 BLOCKED_BY = re.compile(r"<!--\s*factory:blocked-by\s+([\d,\s]+?)\s*-->")
 
 
-def will_change(body):
-    """The paths or globs under a ticket's `## 会改的文件` (bullets, or one comma-separated line); None without one."""
-    m = re.search(rf"^##[ \t]+{WILL_CHANGE}[ \t]*\n(.*?)(?=^#{{1,2}} |\Z)", body or "", re.MULTILINE | re.DOTALL)
+def issue_section(body, heading):
+    """Body of a `## heading` or `### heading` section of an issue (issue forms render fields as `###`), up to the
+    next heading of the same level or higher; None without one (Agentskills #173)."""
+    m = re.search(rf"^(#{{2,3}})[ \t]+{re.escape(heading)}[ \t\r]*$", body or "", re.MULTILINE)
     if not m:
         return None
+    rest = body[m.end():]
+    end = re.search(rf"^#{{1,{len(m.group(1))}}}[ \t]", rest, re.MULTILINE)
+    return rest[:end.start() if end else len(rest)].strip("\n")
+
+
+def will_change(body):
+    """The paths or globs under a ticket's `## 会改的文件` (or `###`; bullets, or one comma-separated line);
+    None without one."""
+    text = issue_section(body, WILL_CHANGE)
+    if text is None:
+        return None
     out = []
-    for line in m.group(1).splitlines():
+    for line in text.splitlines():
         line = re.sub(r"^\s*[-*]\s+", "", line)
         out += [x.strip("`") for x in re.split(r"[,，、\s]+", line) if x.strip("`")]
     return out
@@ -2066,8 +2174,8 @@ SPECIFIED_HEADINGS = ("判定命令", WILL_CHANGE)
 
 
 def intake_class(body):
-    """`specified` when the issue has both `## 判定命令` and `## 会改的文件` headings, else `open`."""
-    found = all(re.search(rf"^##[ \t]+{h}[ \t\r]*$", body or "", re.MULTILINE) for h in SPECIFIED_HEADINGS)
+    """`specified` when the issue has both `判定命令` and `会改的文件` headings (`##` or `###`), else `open`."""
+    found = all(issue_section(body, h) is not None for h in SPECIFIED_HEADINGS)
     return "specified" if found else "open"
 
 
@@ -2157,7 +2265,8 @@ def stall_row(n, job):
 def human_why(n, j):
     stalled = "\n## Why\nStalled twice in " in (job_dir(j["id"]) / "decision.md").read_text()
     if not j["round"]:
-        return f"stalled twice in {read_events(j['id'])[-1]['from']}; delete factory/jobs/{j['id']} to retry"
+        what = "stalled twice" if stalled else "a file refused twice"
+        return f"{what} in {read_events(j['id'])[-1]['from']}; delete factory/jobs/{j['id']} to retry"
     if last_gate(j) == "BASE-RED":
         why = f"{BASE} fails the checks; fix it, then job advance {j['id']} gate"
     elif j["pr"]:
@@ -2206,10 +2315,15 @@ def queue_job_row(n, j):
 def cmd_queue():
     jobs = {j["issue"]: j for j in all_jobs()}
     rows = []
-    # A needs-human job is done once its PR is merged on GitHub, which also closes the issue.
+    # A job is done once its PR is merged on GitHub, which also closes the issue: a needs-human job that way gets
+    # its approval, and a person or a merge bot can merge any other job's PR while it is still in flight.
     for j in jobs.values():
-        if j["stage"] == "needs-human" and pr_merged(j):
-            save(advance(sync(j), "merged"))
+        old = j["stage"]
+        if old in HAND_MERGEABLE and pr_merged(j):
+            save(advance(sync(j, run_proofs=old == "needs-human"), "merged"))
+            if old != "needs-human":
+                print(f"job: {j['id']}: PR #{j['pr']} was merged on GitHub while the job was in {old}; "
+                      "it is merged now, stop any agent still running for it", file=sys.stderr)
     issues = [i for i in api_list(repo_api(f"issues?state=open&labels={urlquote(LABELS['queue'], safe='')}"))
               if "pull_request" not in i]
     prs = api_list(repo_api("pulls?state=open")) if any(i["number"] not in jobs for i in issues) else []
@@ -2323,6 +2437,8 @@ def doctor_agentskills_lock(check):
         return
     name = "agentskills lock"
     if not (REPO / "agentskills.lock.json").is_file():
+        if CONFIG.get("engine"):  # installed by `job init`, which records the engine's source instead
+            return
         print(f"warn {name}: 没有锁文件，工厂和技能的副本漂移没人管；跑 agentskills_sync.py init")
         return
     script, dirs = find_agentskills_script()
@@ -2366,8 +2482,34 @@ def doctor_checks_sh():
     return None if os.access(FACTORY / "checks.sh", os.X_OK) else "factory/checks.sh isn't executable"
 
 
+CHECKS_PLACEHOLDER = "exit 1  # 填上项目的检查命令"  # the template's last line, which `job init` replaces when it can
+
+
+def doctor_checks_filled():
+    path = FACTORY / "checks.sh"
+    lines = path.read_text().splitlines() if path.is_file() else []
+    if any(" ".join(line.split()) == " ".join(CHECKS_PLACEHOLDER.split()) for line in lines):
+        return f"factory/checks.sh is still the template (`{CHECKS_PLACEHOLDER}`); put this repo's checks there"
+    return None
+
+
+def doctor_human_review_paths():
+    paths = CONFIG.get("human_review_paths")
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        return "expected a list of path pattern strings, relative to the repo root"
+    if not paths:
+        return ("empty: nothing would go to a person; list CI, deploy, migration and permission paths "
+                "(job init's default: " + ", ".join(INIT_REVIEW_PATHS) + ")")
+    if "*" in paths:
+        return "`*` sends every job to a person, which means it was never set; list the paths that need a person"
+    return None
+
+
 def doctor_decision_docs():
     pats = CONFIG.get("decision_docs")
+    if not pats:
+        return ("config.json doesn't list where settled decisions are recorded; intake and spec-writer would ask "
+                f"people about things the project may have already decided (job init's default: {INIT_DECISIONS}/*)")
     if not isinstance(pats, list) or not all(isinstance(p, str) for p in pats):
         return "expected a list of path pattern strings, relative to the repo root"
     missing = []
@@ -2401,6 +2543,15 @@ def doctor_quality(check):
         print(f"warn quality tools: python3 is {sys.version.split()[0]}; crapper, dryer and mutator need 3.11+")
 
 
+def warn_worktree_setup():
+    """doctor: a fresh worktree is initialised only by config `worktree_setup`; empty is fine for a project that
+    needs no setup, so this warns, never fails."""
+    if CONFIG.get("kit_path") or (CONFIG.get("worktree_setup") or "").strip():
+        return
+    print("warn worktree_setup: empty, so a new worktree gets no setup (installing dependencies, AGENTS.md's clone "
+          "setup); set config.json worktree_setup if the project needs any")
+
+
 def doctor_notes():
     text_deps = [(p["id"], (p.get("published") or {}).get("text_deps")) for p in all_plans()]
     text_deps = [(i, ns) for i, ns in text_deps if ns]
@@ -2421,9 +2572,22 @@ def doctor_notes():
           f"ccr_routes={str(caps['ccr_routes']).lower()} search={str(caps['search']).lower()} cpus={caps['cpus']} user={caps['gh_user']}")
 
 
-def cmd_doctor():
-    results = []
+def doctor_engine():
+    """doctor: which engine `job init` installed; warn when its main has moved past it (an older engine still runs)."""
+    engine = CONFIG.get("engine")
+    if not isinstance(engine, dict) or not engine.get("commit"):
+        return
+    repo, sha = engine.get("repo") or ENGINE_REPO, engine["commit"]
+    print(f"ok   engine: {repo}@{sha[:12]}")
+    cmp = api("GET", f"repos/{repo}/compare/{sha}...main", check=False)
+    if cmp is None:
+        print(f"warn engine: couldn't compare {sha[:12]} with {repo} main (`gh api repos/{repo}/compare/...` failed)")
+    elif cmp.get("ahead_by", 0) > 0:
+        print(f"warn engine: {repo} main 比装的引擎新 {cmp['ahead_by']} 个提交；跑 factory/bin/job init 更新")
 
+
+def checker(results):
+    """A check(name, fn) that prints `ok   <name>` or `FAIL <name>: <why>` and appends the outcome to results."""
     def check(name, fn):
         try:
             why = fn()
@@ -2431,7 +2595,12 @@ def cmd_doctor():
             why = str(e)
         results.append(why is None)
         print(f"ok   {name}" if why is None else f"FAIL {name}: {why}")
+    return check
 
+
+def cmd_doctor():
+    results = []
+    check = checker(results)
     check("full clone", doctor_full_clone)
     check("origin is on GitHub", lambda: None if repo_slug() else "")
     check("REST reads issues", lambda: None if api("GET", repo_api("issues?per_page=1"), check=False)
@@ -2441,20 +2610,283 @@ def cmd_doctor():
         else f"origin has no branch {BASE}")
     check("labels exist", doctor_labels)
     check("checks.sh is executable", doctor_checks_sh)
+    check("checks.sh is filled in", doctor_checks_filled)
+    check("human_review_paths", doctor_human_review_paths)
     check("merge_method", lambda: NO_REBASE if CONFIG["merge_method"] == "rebase" else None)
     check("tools.json is valid", doctor_tools_json)
     check("agent frontmatter keys", check_agents)
     warn_sync_prompts()
     doctor_agentskills_lock(check)
-    if CONFIG.get("decision_docs") == [] or "decision_docs" not in CONFIG:
-        print("warn decision_docs: config.json doesn't list where settled decisions are recorded; intake and "
-              "spec-writer will ask people about things the project may have already decided")
-    else:
-        check("decision_docs", doctor_decision_docs)
+    doctor_engine()
+    check("decision_docs", doctor_decision_docs)
     doctor_quality(check)
+    warn_worktree_setup()
     doctor_notes()
     if not all(results):
         sys.exit(1)
+
+
+# ---- init: install the factory, or update its engine files -----------------
+
+ENGINE_REPO = "XartLab/Nightshift"
+WINDOWS = ("win32", "cygwin", "msys")
+INIT_REVIEW_PATHS = [".github/**", "factory/**", ".claude/**"]
+INIT_DECISIONS = "docs/decisions"
+CHECKS_BY_FILE = (("package.json", "pnpm test"), ("pyproject.toml", "pytest"), ("Cargo.toml", "cargo test"))
+INIT_GITIGNORE = ("/factory/jobs/", "/factory/plans/", "/factory/.tools/", "/factory/**/__pycache__/")
+LABEL_STYLE = {  # config.json `labels` key -> color, description
+    "queue": ("5319E7", "Build this with the software factory"),
+    "needs_info": ("FBCA04", "The factory asked the author a question"),
+    "needs_human": ("D93F0B", "The factory needs a human decision on the PR"),
+    "escaped": ("B60205", "A defect that got past the factory into the base branch"),
+    "plan": ("0E8A16", "A goal for /factory plan to break into factory issues"),
+}
+DECISIONS_README = """# 决定记录
+
+`factory/config.json` 的 `decision_docs` 指向这个目录。intake 和 spec-writer 问人之前先读这里：定过的照做，不再问；
+人回答过的项目级决定，spec 会要求随那张单的 PR 记进来。
+
+一条决定一节：
+
+```markdown
+## <日期 YYYY-MM-DD>：<一句话的决定>
+
+- 决定：<定了什么>
+- 为什么：<依据：实测、出处或谁定的>
+- 影响：<从此以后哪些做法跟着变>
+```
+
+定了**不做**的事记在 [NOT-DOING.md](NOT-DOING.md)：agent 读到匹配的条目直接照着回答，不再把同一件事推给人。
+"""
+NOT_DOING = """# 定了不做的事
+
+intake、spec-writer 读到跟请求匹配的条目，直接照着回答（不做，以及为什么），不再问人第二遍。
+一条一节，原话照抄，不改写：
+
+```markdown
+## <日期 YYYY-MM-DD>：<不做什么>
+
+- 原话：「<谁在哪里说的原话>」
+- 为什么不做：<理由>
+```
+"""
+
+
+def init_args(args):
+    opts = {"--from": None, "--ref": "main"}
+    it = iter(args)
+    for a in it:
+        value = next(it, None) if a in opts else None
+        if value is None:
+            die(f"bad arguments: init {' '.join(args)}\nusage: job init [--from <engine dir>] [--ref <ref>]")
+        opts[a] = value
+    return opts
+
+
+def init_self_checks():
+    """Item by item like doctor; exits 1 after printing every FAIL. Points REPO at the repo being installed into."""
+    global REPO
+    results = []
+    check = checker(results)
+    check("platform", lambda: None if sys.platform not in WINDOWS else
+          f"native Windows ({sys.platform}) isn't supported: the factory runs on Linux or WSL only; run it in WSL")
+    if not all(results):
+        sys.exit(1)
+    top = run(["git", "rev-parse", "--show-toplevel"], cwd=os.getcwd(), check=False)
+    check("git repository", lambda: None if top.returncode == 0 else f"{os.getcwd()} isn't in a git repository")
+    if not all(results):
+        sys.exit(1)
+    REPO = Path(top.stdout.strip())
+    check("full clone", doctor_full_clone)
+    check("origin is on GitHub", lambda: None if repo_slug() else "")
+    check("gh auth status", lambda: None if run(["gh", "auth", "status"], check=False).returncode == 0
+          else "gh isn't logged in; run `gh auth login`")
+    info = {}
+
+    def push():
+        repo = api("GET", f"repos/{repo_slug()}", check=False)
+        if repo is None:
+            return f"`gh api repos/{repo_slug()}` failed"
+        info.update(repo)
+        return None if (repo.get("permissions") or {}).get("push") else \
+            f"this gh user can't push to {repo_slug()}; the factory pushes branches and creates labels"
+    check("push permission", push)
+
+    def default_branch():
+        branch = info.get("default_branch")
+        if not branch:
+            return "unknown: the repo couldn't be read"
+        return None if run(["git", "ls-remote", "--exit-code", "--heads", "origin", branch],
+                           check=False).returncode == 0 else f"origin has no branch {branch}"
+    check("default branch exists", default_branch)
+    check("python >= 3.15", lambda: None if sys.version_info >= (3, 15) else
+          f"python3 is {sys.version.split()[0]}; the factory's scripts need 3.15 (e.g. `uv run --python 3.15`)")
+
+    def claude():
+        try:
+            res = run(["claude", "--version"], check=False)
+        except OSError:
+            return "claude isn't on PATH; install Claude Code"
+        return None if res.returncode == 0 else f"`claude --version` exited {res.returncode}"
+    check("claude --version", claude)
+    if not all(results):
+        sys.exit(1)
+    return info
+
+
+def engine_source(opts, scratch):
+    """(engine/ directory, commit) from --from <path>, or from the GitHub tarball of --ref (default main)."""
+    if opts["--from"]:
+        src = Path(opts["--from"]).resolve()
+        if not (src / "factory" / "bin" / "job").is_file() or not (src / "claude" / "agents").is_dir():
+            raise Refused(f"{src} isn't the engine/ of a Nightshift checkout (no factory/bin/job or claude/agents/)")
+        res = run(["git", "rev-parse", "HEAD"], cwd=src, check=False)
+        if res.returncode != 0:
+            raise Refused(f"{src} isn't in a git checkout, so the engine commit can't be recorded")
+        sha = res.stdout.strip()
+        if run(["git", "status", "--porcelain", "--", "."], cwd=src, check=False).stdout.strip():
+            print(f"warn engine: {src} has uncommitted changes; engine.commit records {sha[:12]} without them")
+        return src, sha
+    sha = api("GET", f"repos/{ENGINE_REPO}/commits/{urlquote(opts['--ref'], safe='')}")["sha"]
+    res = subprocess.run(["gh", "api", f"repos/{ENGINE_REPO}/tarball/{sha}"], capture_output=True, check=False)
+    if res.returncode != 0:
+        raise Refused(f"`gh api repos/{ENGINE_REPO}/tarball/{sha}` failed: {res.stderr.decode(errors='replace')}")
+    with tarfile.open(fileobj=io.BytesIO(res.stdout), mode="r:*") as tar:
+        tar.extractall(scratch, filter="data")
+    tops = [p for p in Path(scratch).iterdir() if (p / "engine" / "factory" / "bin" / "job").is_file()]
+    if len(tops) != 1:
+        raise Refused(f"the {ENGINE_REPO} tarball at {sha[:12]} has no engine/factory/bin/job")
+    return tops[0] / "engine", sha
+
+
+def engine_files(src):
+    """(source file, installed path relative to the repo root) for every file init overwrites."""
+    pairs = []
+    for sub in ("bin", "tools"):
+        root = src / "factory" / sub
+        pairs += [(p, f"factory/{sub}/{p.relative_to(root).as_posix()}") for p in sorted(root.rglob("*"))
+                  if p.is_file() and "__pycache__" not in p.parts]
+    pairs += [(p, f".claude/agents/{p.name}") for p in sorted((src / "claude" / "agents").glob("*.md"))]
+    pairs.append((src / "claude" / "skills" / "factory" / "SKILL.md.tmpl", ".claude/skills/factory/SKILL.md"))
+    return pairs
+
+
+def locally_changed(paths):
+    """Those of paths with uncommitted changes (staged or not), like `git diff --quiet HEAD -- <paths>`."""
+    res = run(["git", "diff", "--name-only", "HEAD", "--", *paths], check=False)
+    if res.returncode != 0:  # no commit yet: against the index
+        res = run(["git", "diff", "--name-only", "--", *paths], check=False)
+    return res.stdout.split()
+
+
+def untracked_and_different(pairs):
+    """Installed paths git doesn't track yet whose content isn't the new source's: an edit made after an install that
+    was never committed, which `git diff HEAD` can't see (Codex on #59). Identical files keep init idempotent."""
+    rels = [rel for _, rel in pairs if (REPO / rel).is_file()]
+    tracked = set(run(["git", "ls-files", "--", *rels], check=False).stdout.split()) if rels else set()
+    return [rel for source, rel in pairs
+            if rel in rels and rel not in tracked and (REPO / rel).read_bytes() != source.read_bytes()]
+
+
+def write_if_changed(path, data, mode=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.is_file() or path.read_bytes() != data:
+        path.write_bytes(data)
+    if mode is not None and path.stat().st_mode & 0o777 != mode:
+        path.chmod(mode)
+
+
+def init_checks_sh(template):
+    """checks.sh from the template, with the commands for the repo types found; (text, commands)."""
+    cmds = [cmd for name, cmd in CHECKS_BY_FILE if (REPO / name).is_file()]
+    head, sep, _ = template.partition("set -euo pipefail\n")
+    if not cmds or not sep:
+        return template, []
+    return f"{head}{sep}\n" + "".join(f"{c}\n" for c in cmds), cmds
+
+
+def init_config(src, info):
+    cfg = json.loads((src / "factory" / "config.json").read_text())
+    cfg["base_branch"] = info["default_branch"]
+    if not cfg.get("human_review_paths") or "*" in cfg["human_review_paths"]:
+        cfg["human_review_paths"] = list(INIT_REVIEW_PATHS)
+    if not cfg.get("decision_docs"):
+        cfg["decision_docs"] = [f"{INIT_DECISIONS}/*"]
+    return cfg
+
+
+def init_labels(cfg):
+    for key, name in (cfg.get("labels") or LABELS).items():
+        if api("GET", repo_api(f"labels/{urlquote(name, safe='')}"), check=False) is not None:
+            continue
+        color, description = LABEL_STYLE.get(key, ("EDEDED", "software factory"))
+        api("POST", repo_api("labels"), {"name": name, "color": color, "description": description})
+        print(f"label {name}: created")
+
+
+def cmd_init(args):
+    opts = init_args(args)
+    info = init_self_checks()
+    with tempfile.TemporaryDirectory() as scratch:
+        src, sha = engine_source(opts, scratch)
+        pairs = engine_files(src)
+        conf_path = REPO / "factory" / "config.json"
+        cfg = json.loads(conf_path.read_text()) if conf_path.is_file() else init_config(src, info)
+        # The project's own prompts (sync-prompts' skip list, default agents/intake.md): installed once, kept after,
+        # so a local edit to one doesn't block an update.
+        own = {f".claude/{p}" for p in cfg.get("sync_prompts_skip", ["agents/intake.md"])}
+        guarded = [(source, rel) for source, rel in pairs if not (rel in own and (REPO / rel).is_file())]
+        changed = locally_changed([rel for _, rel in guarded]) + untracked_and_different(guarded)
+        if changed:
+            print("FAIL engine files have uncommitted changes; nothing was overwritten. Commit them (and send the fix to "
+                  f"{ENGINE_REPO}) or discard them, then run init again:\n" + "".join(f"  {c}\n" for c in changed),
+                  end="")
+            sys.exit(1)
+        init_labels(cfg)
+        for source, rel in pairs:
+            if rel in own and (REPO / rel).is_file():
+                continue
+            mode = source.stat().st_mode & 0o777
+            write_if_changed(REPO / rel, source.read_bytes(), mode | 0o755 if rel.startswith("factory/") else mode)
+        notes = []
+        if not (REPO / "factory" / "tools.json").exists():
+            write_if_changed(REPO / "factory" / "tools.json", (src / "factory" / "tools.json").read_bytes())
+        checks = REPO / "factory" / "checks.sh"
+        if not checks.exists():
+            text, cmds = init_checks_sh((src / "factory" / "checks.sh").read_text())
+            write_if_changed(checks, text.encode(), 0o755)
+            notes.append(f"factory/checks.sh: wrote `{'`, `'.join(cmds)}` from the repo's files; confirm they are the "
+                         "project's real checks (lint, typecheck, build too) before the first run" if cmds else
+                         "factory/checks.sh: no package.json, pyproject.toml or Cargo.toml; replace "
+                         f"`{CHECKS_PLACEHOLDER}` with the project's checks (job doctor fails until then)")
+        if not conf_path.is_file():
+            notes.append("human_review_paths: " + ", ".join(cfg["human_review_paths"]) + "; if the project keeps a "
+                         "protected-paths list, add its entries here too")
+        if cfg.get("engine") != {"repo": ENGINE_REPO, "commit": sha} or not conf_path.is_file():
+            cfg["engine"] = {"repo": ENGINE_REPO, "commit": sha}
+            write_if_changed(conf_path, (json.dumps(cfg, indent=2, ensure_ascii=False) + "\n").encode())
+        if f"{INIT_DECISIONS}/*" in (cfg.get("decision_docs") or []):
+            for name, text in (("README.md", DECISIONS_README), ("NOT-DOING.md", NOT_DOING)):
+                if not (REPO / INIT_DECISIONS / name).exists():
+                    write_if_changed(REPO / INIT_DECISIONS / name, text.encode())
+        gitignore = REPO / ".gitignore"
+        have = gitignore.read_text() if gitignore.is_file() else ""
+        missing = [line for line in INIT_GITIGNORE if line not in have.splitlines()]
+        if missing:
+            gitignore.write_text(have + ("\n" if have and not have.endswith("\n") else "") + "\n".join(missing) + "\n")
+    if not (cfg.get("dev_server") or {}).get("cmd") or not (cfg.get("ft") or {}).get("shot"):
+        notes.append("dev_server.cmd / ft.shot are empty: jobs whose SURFACES include ui get no page evidence at the "
+                     "gate; fill them in factory/config.json if the project has a UI")
+    print(f"engine: {ENGINE_REPO}@{sha[:12]} installed into {REPO}")
+    for note in notes:
+        print(f"note {note}")
+    print("job doctor:")
+    sys.stdout.flush()
+    res = subprocess.run([str(REPO / "factory" / "bin" / "job"), "doctor"], cwd=REPO, capture_output=True, text=True,
+                         check=False)
+    print(res.stdout, end="")
+    print(res.stderr, end="", file=sys.stderr)
+    sys.exit(res.returncode)
 
 
 NO_REBASE = "合并前同步会产生合并提交，rebase 合并不支持；改用 squash 或 merge"
@@ -4208,9 +4640,29 @@ def cmd_plan(args):
         die(usage)
 
 
+def worktree_setup(job):
+    """config `worktree_setup` in a fresh worktree (installing dependencies, AGENTS.md's clone setup); on failure
+    the job goes to needs-human with REASON env. Returns the job."""
+    cmd = (CONFIG.get("worktree_setup") or "").strip()
+    if not cmd:
+        return job
+    res = subprocess.run(cmd, shell=True, cwd=job["worktree"], capture_output=True, text=True, check=False)
+    if res.returncode == 0:
+        return job
+    tail = "\n".join(((res.stderr or "") + (res.stdout or "")).strip().splitlines()[-20:])
+    escalate(job, f"worktree_setup `{cmd}` in {job['worktree']} exited {res.returncode}:\n\n```text\n{tail}\n```", "env")
+    job = advance(job, "needs-human", stalled=True)
+    return job
+
+
 def run_advance(args):
-    job = advance(sync(resolve(args[0])), args[1])
+    job = sync(resolve(args[0]))
+    old, fresh = job["stage"], not Path(job["worktree"]).exists()
+    job = advance(job, args[1])
     save(sync(job))
+    if old == "intake" and job["stage"] == "spec" and fresh:  # a re-intake keeps its worktree, and its setup
+        job = worktree_setup(job)
+        save(job)
     print(f"{job['id']}: {job['stage']} (round {job['round']})")
 
 
@@ -4241,7 +4693,7 @@ def run_new_issue(args):
 # where an agent or a person is next. It never holds a job's lock: every step is a separate `job`/`gate`/`evidence`
 # process that takes the lock itself.
 
-DRIVEN = ("build", "gate", "review", "approve")
+DRIVEN = ("intake", "needs-info", "spec", "build", "gate", "review", "approve")
 
 
 class DriveWait(Exception):
@@ -4250,6 +4702,10 @@ class DriveWait(Exception):
 
 class DriveStop(Exception):
     """`STOP <stage> <why>`: a person (or the orchestrator's judgement) is next."""
+
+
+class DriveRefused(DriveStop):
+    """A step the file of a role depends on was refused (`drive_job(..., refusable=True)`): drive sends it back once."""
 
 
 class DriveError(Exception):
@@ -4272,13 +4728,14 @@ def drive_id(arg):
     die(f"no job for issue #{arg}")
 
 
-def drive_job(*args, stop=None):
-    """Run one `job` step. Non-zero exit: a refusal (STOP at `stop`) when `stop` is given, else an error."""
+def drive_job(*args, stop=None, refusable=False):
+    """Run one `job` step. Non-zero exit: a refusal (STOP at `stop`; DriveRefused when `refusable`) when `stop` is
+    given, else an error."""
     res = run([sys.executable, str(BIN / "job"), *args], check=False)
     if res.returncode:
         out = (res.stderr or res.stdout).strip().removeprefix("job: ")
         if stop:
-            raise DriveStop(stop, out)
+            raise (DriveRefused if refusable else DriveStop)(stop, out)
         raise DriveError(f"factory/bin/job {' '.join(args)}", out)
     return res.stdout.strip()
 
@@ -4289,6 +4746,123 @@ def dispatch(job_id, role, model, tail=None):
     if tail:
         prompt = "\n".join([*prompt.splitlines()[:3], tail])
     return f"DISPATCH {role} {model}\n{prompt}"
+
+
+def update_job(job_id, change):
+    """Change job.json under its lock, for the one thing drive writes itself (`refusals`); drive holds no lock."""
+    with (job_dir(job_id) / ".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = job_dir(job_id) / "job.json"
+        job = json.loads(path.read_text())
+        change(job)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(job, indent=2) + "\n")
+        tmp.replace(path)
+
+
+def file_sig(path):
+    st = path.stat()
+    return [st.st_mtime_ns, st.st_size]
+
+
+def drive_role_file(job_id, stage, role, fname, act):
+    """Run `act`, which judges the file `role` wrote at `stage`. A refusal goes back to `role` once, word for word
+    (job.json `refusals.<stage>.<role>` = 1, and the refused file's mtime and size, so drive can tell that the role
+    hasn't rewritten it yet: WAIT); refused again, the job is needs-human (REASON other)."""
+    job, path = peek(job_id), job_dir(job_id) / fname
+    count = ((job.get("refusals") or {}).get(stage) or {}).get(role, 0)
+    seen = ((job.get("refused_files") or {}).get(stage) or {}).get(role)
+    if count == 1 and path.exists() and file_sig(path) == seen:
+        raise DriveWait(stage, role)
+
+    def clear(j):
+        for key in ("refusals", "refused_files"):
+            (j.get(key) or {}).pop(stage, None)
+    try:
+        out = act()
+    except DriveRefused as r:
+        why = " ".join(r.args[1].split())
+        if count >= 1:
+            def twice(j):
+                j.setdefault("refusals", {}).setdefault(stage, {})[role] = 2
+            update_job(job_id, twice)
+            escalate(peek(job_id), f"{fname} was refused twice. The second time: {why}", "other")
+            drive_job("advance", job_id, "needs-human", stop=stage)
+            raise DriveStop("needs-human", f"{fname} was refused twice: {why}") from None
+
+        def once(j):
+            j.setdefault("refusals", {}).setdefault(stage, {})[role] = 1
+            j.setdefault("refused_files", {}).setdefault(stage, {})[role] = file_sig(path)
+        update_job(job_id, once)
+        model = (job.get("intake_model") or agent_model("intake")) if role == "intake" else agent_model(role)
+        return [dispatch(job_id, role, model, f"Your {fname} was refused: {why}. Fix it and rewrite {fname}.")]
+    except DriveStop:
+        if count:
+            update_job(job_id, clear)
+        raise
+    if count:
+        update_job(job_id, clear)
+    return out
+
+
+def drive_intake_act(job_id):
+    """intake.md's first line, as the factory skill reads it: ACCEPT routes and moves on to spec (None); the other
+    two end the drive. Anything else is a refusal."""
+    path = job_dir(job_id) / "intake.md"
+    decision = header(path).get("DECISION")
+    if decision == "ACCEPT":
+        res = run([str(BIN / "route"), job_id], check=False)
+        if res.returncode:
+            raise DriveRefused("intake", (res.stderr or res.stdout).strip().removeprefix("route: "))
+        drive_job("advance", job_id, "spec", stop="intake", refusable=True)
+        return
+    if decision in {"NEEDS-INFO", "REJECT"}:
+        target = "needs-info" if decision == "NEEDS-INFO" else "rejected"
+        raise DriveStop(target, drive_job("advance", job_id, target, stop="intake", refusable=True))
+    raise DriveRefused("intake", f"intake.md's first line is {first_line(path)!r}, "
+                                 "not DECISION: ACCEPT, NEEDS-INFO or REJECT")
+
+
+def drive_spec_act(job_id):
+    """spec.md: NEEDS-DECISION asks the author (needs-info); otherwise it moves to build and the builder starts."""
+    if first_line(job_dir(job_id) / "spec.md") == "STATUS: NEEDS-DECISION":
+        raise DriveStop("needs-info", drive_job("advance", job_id, "needs-info", stop="spec", refusable=True))
+    drive_job("advance", job_id, "build", stop="spec", refusable=True)
+    return [dispatch(job_id, "builder", peek(job_id)["agents"]["builder"])]
+
+
+def drive_needs_info(job_id):
+    """`job queue` says resume once the author replied: back to intake. Otherwise wait for the author."""
+    for line in drive_job("queue").splitlines():
+        row = line.split("\t")
+        if len(row) >= 5 and row[2] == job_id:
+            if row[0] == "resume":
+                drive_job("advance", job_id, "intake", stop="needs-info")
+                return
+            raise DriveStop("needs-info", row[4])
+    raise DriveStop("needs-info", "the job isn't in `job queue` (its issue is closed or lost the factory label)")
+
+
+def drive_early(job_id, stage):
+    """needs-info, intake and spec: the next DISPATCH blocks, or None once the job is in build."""
+    if stage == "needs-info":
+        drive_needs_info(job_id)
+        stage = "intake"
+    if stage == "intake":
+        if not (job_dir(job_id) / "intake.md").exists():
+            job = peek(job_id)
+            return [dispatch(job_id, "intake", job.get("intake_model") or agent_model("intake"))]
+        out = drive_role_file(job_id, "intake", "intake", "intake.md", lambda: drive_intake_act(job_id))
+        if out:
+            return out
+        if peek(job_id)["stage"] != "spec":  # worktree_setup failed: the job is needs-human
+            raise DriveStop("needs-human", f"worktree_setup failed: {reasons_in(job_dir(job_id) / 'decision.md')}, "
+                                           "see decision.md")
+    if peek(job_id)["round"]:  # back from the gate with a holdout that passes on the base: the factory skill's case
+        raise DriveStop("spec", "returned from the gate (HOLDOUT: WEAK); follow the factory skill for spec")
+    if not (job_dir(job_id) / "spec.md").exists():
+        return [dispatch(job_id, "spec-writer", agent_model("spec-writer"))]
+    return drive_role_file(job_id, "spec", "spec-writer", "spec.md", lambda: drive_spec_act(job_id))
 
 
 def drive_gate(job_id):
@@ -4339,10 +4913,22 @@ def drive_approve(job_id):
     raise DriveStop("approve", "decision.md's first line is neither APPROVE nor ESCALATE")
 
 
+def build_written_since_entry(job_id):
+    """build.md exists and was written after the job last entered build: a round's READY or BLOCKED left from the
+    round before is not the builder's answer to this one."""
+    path = job_dir(job_id) / "build.md"
+    if not path.exists():
+        return False
+    entry = stage_entry(peek(job_id))
+    return entry is None or path.stat().st_mtime >= entry[1].timestamp()
+
+
 def drive(job_id):
     stage = peek(job_id)["stage"]
+    if stage in {"needs-info", "intake", "spec"}:
+        return drive_early(job_id, stage)
     if stage == "build":
-        if not (job_dir(job_id) / "build.md").exists():
+        if not build_written_since_entry(job_id):
             raise DriveWait("build", "builder")
         h = header(job_dir(job_id) / "build.md")
         if h.get("STATUS") != "READY":
@@ -4415,6 +5001,7 @@ def cmd_prompt(job, role):
 
 COMMANDS = {
     "doctor": (lambda a: not a, lambda a: cmd_doctor()),
+    "init": (lambda a: True, cmd_init),
     "queue": (lambda a: not a, lambda a: cmd_queue()),
     "search": (lambda a: bool(a), lambda a: cmd_search(" ".join(a))),
     "new-issue": (lambda a: len(a) == 2 or (len(a) == 3 and a[0] == "--plan"), run_new_issue),
@@ -4422,6 +5009,7 @@ COMMANDS = {
     "create": (lambda a: len(a) == 1 and a[0].isdigit(), lambda a: cmd_create(a[0])),
     "advance": (lambda a: len(a) == 2, run_advance),
     "drive": (lambda a: len(a) == 1, lambda a: cmd_drive(a[0])),
+    "entered": (lambda a: len(a) == 1, lambda a: cmd_entered(resolve(a[0]))),
     "merge": (lambda a: len(a) == 1, lambda a: cmd_merge(resolve(a[0]))),
     "rework": (lambda a: len(a) == 1, lambda a: cmd_rework(resolve(a[0]))),
     "prompt": (lambda a: len(a) == 2, lambda a: cmd_prompt(resolve(a[0]), a[1])),

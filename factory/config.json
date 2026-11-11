@@ -1,5 +1,5 @@
 {
-  "concurrency": 3,
+  "concurrency": 1,
   "max_rounds": 3,
   "base_branch": "main",
   "merge_method": "squash",
@@ -228,5 +228,18 @@
   "decision_docs": [
     "docs/adr/*",
     "docs/decisions/*"
-  ]
+  ],
+  "engine": {
+    "repo": "XartLab/Nightshift",
+    "commit": "dd5350f0db808fb3c79c85d589030db4d6769360"
+  },
+  "loop": {
+    "backend": "orca",
+    "agent": "claude",
+    "hosts": [
+      "claude",
+      "codex",
+      "omp"
+    ]
+  }
 }
