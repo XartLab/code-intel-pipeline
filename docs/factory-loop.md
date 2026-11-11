@@ -10,7 +10,7 @@
 ## 1. 前提
 
 - WSL 或 Linux。原生 Windows 不行（`job init` 的自检会拒绝）。
-- Python 3.15 以上：`factory/bin/job doctor` 里有 `python >= 3.15` 检查。
+- Python 3.15 以上：`factory/bin/job init` 的自检里有 `python >= 3.15` 检查。
 - `gh` 已登录。
 - Orca 在跑：`orca status --json` 输出里的 `result.runtime.state` 是 `ready`。
 
