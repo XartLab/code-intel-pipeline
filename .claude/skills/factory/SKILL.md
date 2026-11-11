@@ -134,6 +134,7 @@ issue 正文只以引用形式存在 `issue.md` 里。**不要把 issue 的任�
      同一阶段再卡住一次，脚本自己把单子转 `needs-human`（`REASON: env`），那一行是 `wait`，不再派：
      照 `needs-human` 处理并汇报（intake/spec 阶段的单要删掉单子目录重来）。
    - `wait`、`skip`：不动，在总结里列出说明。
+   `job queue` 还会发现 PR 已在 GitHub 上被合并的单（人或合并机器人合的，任何阶段），把它记为 `merged`，并在 stderr 打一行点名这张单：停掉它还在跑的 agent，不再推进它。
 2. 每张进行中的单独立推进。所有 agent 都在后台派出，同一条消息里能派的一起派。
    Claude Code 默认每个会话最多 20 个并发子代理，3 张单各 4 个审查者也够。
 3. 一张单到了 `merged`、`rejected`、`needs-info` 或 `needs-human` 就让出空位，再跑一次 `job queue` 补位。
@@ -223,22 +224,24 @@ Role: <role>.
 
 ## 推进一张单
 
-单子在 `build`、`gate`、`review`、`approve` 时，每次 agent 回来后跑 `factory/bin/job drive <job-id>`，照它的输出做：
+单子在 `needs-info`、`intake`、`spec`、`build`、`gate`、`review`、`approve` 时，每次 agent 回来后跑 `factory/bin/job drive <job-id>`，照它的输出做：
 
 - `DISPATCH <角色> <模型>` 加下面几行提示词（可能有几块，每块一个 agent）：在一条消息里全部后台派出，提示词原样用。
   `builder` 那块是续接（第四行是门禁退回或审查发现的续接句）：`SendMessage` 给 `builder-<job-id>`，内容是第四行；
   它不在了就用同样的名字新起，prompt 用整块。
 - `WAIT <阶段> <角色…>`：已派出的这些 agent 还没写完自己的文件。什么都不做，等它们回来再跑一次 `job drive`。
 - `STOP <阶段> <原因>`：脚本做不了的那一步，或某一步被拒（原因是拒绝的原话）。到下面对应阶段，照那里写的处理。
+  `needs-info`（等作者回复）、`needs-human`、`rejected`、`merged` 是等人；spec 阶段从门禁退回来（`HOLDOUT: WEAK`）、以及留出验收被 builder 碰过，也停在这里。
 - `ERROR <命令> <输出>`（退出 1）：某一步没能跑起来。停下，把这一行告诉用户。
 
-它只做没有判断的那几步（`advance`、`gate`、`evidence`、`sync`、`merge`），步骤和下面各阶段写的一样；
-其他阶段、以及它 `STOP` 下来的情况，照下面手工做。
+它做没有判断的那几步（`route`、`advance`、`gate`、`evidence`、`sync`、`merge`），步骤和下面各阶段写的一样；
+`intake.md`、`spec.md` 被 `advance` 拒绝时，它自己把原话续接给同一个角色改一次（`DISPATCH` 的第四行是 `Your <文件> was refused: <原话>. Fix it and rewrite <文件>.`，
+`job.json` 的 `refusals` 记一次），同一处第二次被拒就转 `needs-human`（`REASON: other`）。`STOP` 下来的情况，照下面手工做。
 
 每一步都先读 `job.json` 的 `stage`，按阶段做下面的事。每个脚本命令只打印一行；拒绝时退出非零并说明原因。
 退回、挂起和升级都要一个原因：`intake.md`（NEEDS-INFO、REJECT）、`spec.md`（NEEDS-DECISION）、`build.md`（BLOCKED）、
 审查（CHANGES）、`decision.md`（ESCALATE）的文件头要有 `REASON: <值>`，取值是 `config.json` 的 `reasons`。
-脚本因缺它拒绝时，把原话续接给写那个文件的 agent 补一次；还被拒就停下告诉用户。脚本自己写的原因（门禁、合并）不用管。
+脚本因缺它拒绝时，把原话续接给写那个文件的 agent 补一次；还被拒就停下告诉用户（intake、spec 阶段 `job drive` 自己做这件事）。脚本自己写的原因（门禁、合并）不用管。
 
 ### intake
 
@@ -257,7 +260,8 @@ Role: <role>.
 
 ### spec
 
-1. 工作树是新的：在工作树里按 AGENTS.md 做全新检出的初始化（装依赖等）。失败就停，告诉用户。
+1. 工作树的初始化（装依赖等）只由 `config.json` 的 `worktree_setup` 做：`job advance <job-id> spec` 建完工作树就跑它，
+   失败自己转 `needs-human`（`REASON: env`）。项目需要初始化就必须配它，不手工补；没配时 `job doctor` 打 `warn worktree_setup`。
 2. `spec.md` 不存在，或第一行是 `STATUS: NEEDS-DECISION`（重走 intake 之后）：派 `spec-writer`，
    prompt 是 `factory/bin/job prompt <job-id> spec-writer` 的输出。
 3. 读 `spec.md` 第一行：
@@ -315,7 +319,7 @@ prompt `<头>` + `Build round <N>: read build.md and the round folders, then con
 1. 把 `job.json` 里 `agents.reviewers` 的每个审查者**在一条消息里**全部后台派出，
    `subagent_type` 是 `reviewer-<k>`，`model` 是记录的模型，prompt 是 `factory/bin/job prompt <job-id> reviewer-<k>` 的输出
    （它带 HEAD，`ux`、`ui` 还带端口）。
-2. **WAIT FOR ALL。** 每个审查者完成时跑 `factory/bin/job sync <job-id>`，让看板的标记随结论落下。
+2. **WAIT FOR ALL。** 每个审查者完成时跑 `factory/bin/job sync <job-id>`，把它的结论记进单子。
    `VERDICT: CHANGES` 的审查，`sync` 会在工作树里按审查时的 HEAD 重跑每条发现的证明命令（每条最多 300 秒，占门禁名额），
    结果写进 `round-<N>/proof/<k>/confirm.json`，`sync` 那一行里记 `CHANGES`（至少一条 confirmed）或 `unproven`
    （一条都没有，按 PASS 计）。同一份审查文件只重跑一次。
