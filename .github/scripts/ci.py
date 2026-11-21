@@ -18,6 +18,7 @@ import os
 import platform
 import re
 import shutil
+import secrets
 import subprocess
 import sys
 import tarfile
@@ -859,7 +860,9 @@ def configs_acceptance(args: argparse.Namespace) -> None:
 
     env = os.environ.copy()
     env.pop("CODE_INTEL_INTEGRATIONS_MANIFEST", None)
-    repo_dir = work / "repo"
+    # A unique basename: the authority root keys committed runs by repository
+    # name, so a reused `repo` on one host reports a repository key collision.
+    repo_dir = work / f"fixture-{secrets.token_hex(4)}"
     shutil.copytree(fixture / "repo", repo_dir)
     for command in (
         ["git", "init", "-q"],
@@ -882,34 +885,48 @@ def configs_acceptance(args: argparse.Namespace) -> None:
     if args.bundle:
         config_home = work / "config-home"
         extract_configs_bundle(Path(args.bundle).resolve(), config_home)
-        env["CODE_INTEL_HOME"] = str(config_home)
-        plan = subprocess.run(
-            [
-                executable,
-                "orchestrate",
-                "validate",
-                "--action",
-                "Validate",
-                "--repo",
-                str(repo_dir),
-                "--json",
-            ],
-            cwd=work,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        resolved = None
-        try:
-            resolved = json.loads(plan.stdout).get("manifest")
-        except json.JSONDecodeError:
-            resolved = None
         expected = str((config_home / "orchestration" / "integrations.json").resolve())
+
+        def resolved_manifest(home: str | None) -> tuple[int, str | None, str]:
+            environment = env if home is None else {**env, "CODE_INTEL_HOME": home}
+            plan = subprocess.run(
+                [
+                    executable,
+                    "orchestrate",
+                    "--action",
+                    "List",
+                    "--repo",
+                    str(repo_dir),
+                    "--json",
+                ],
+                cwd=work,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            try:
+                return plan.returncode, json.loads(plan.stdout).get("manifest"), plan.stderr
+            except json.JSONDecodeError:
+                return plan.returncode, None, plan.stderr
+
+        # The bundle must win discovery; `orchestrate` validates entrypoints and
+        # the config surface deliberately ships no Rust source, so only the
+        # reported manifest path is asserted, not `ok`.
+        _, resolved, _ = resolved_manifest(str(config_home))
+        env["CODE_INTEL_HOME"] = str(config_home)
+        # Negative control: an empty home must be refused, which is what proves
+        # the variable is honoured rather than silently ignored.
+        empty_home = work / "empty-home"
+        empty_home.mkdir()
+        empty_code, _, empty_stderr = resolved_manifest(str(empty_home))
         checks.append(
             {
                 "name": "configuration-home",
-                "ok": plan.returncode == 0 and resolved == expected,
-                "detail": f"resolved={resolved} expected={expected}",
+                "ok": resolved == expected and empty_code != 0 and "does not contain" in empty_stderr,
+                "detail": (
+                    f"resolved={resolved} expected={expected}; empty-home exit={empty_code} "
+                    f"stderr={empty_stderr.strip()[:160]}"
+                ),
             }
         )
     else:
