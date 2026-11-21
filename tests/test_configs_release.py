@@ -297,10 +297,20 @@ class AcceptancePathTests(unittest.TestCase):
             built.write_text("binary", encoding="utf-8")
             work = Path(temporary) / "work"
             work.mkdir()
-            staged = Path(ci.stage_executable(ci.configs_binary(str(built)), work))
+            staged = Path(ci.stage_executable(ci.configs_binary(str(built)), work / "bin"))
             self.assertTrue(staged.is_file())
             self.assertEqual(staged.parent, (work / "bin").resolve())
             self.assertEqual(staged.read_text(encoding="utf-8"), "binary")
+
+    def test_the_consumer_root_ships_source_without_the_archive_configuration(self) -> None:
+        # The doctor capability validates integration entrypoints under the
+        # manifest's root, so a configuration package alone can never complete a
+        # normal run; the consumer root must carry the source and the bundle must
+        # be the only configuration on it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = ci.consumer_root(Path(temporary))
+            self.assertTrue((root / "crates").is_dir())
+            self.assertFalse((root / "orchestration").exists())
 
 
 if __name__ == "__main__":

@@ -804,21 +804,55 @@ def configs_binary(path: str) -> str:
     return str(resolved)
 
 
-def stage_executable(path: str, work: Path) -> str:
-    """Copy the built binary into a consumer-style bin directory and return it.
+def stage_executable(path: str, bin_dir: Path) -> str:
+    """Copy the built binary into a consumer bin directory and return the copy.
 
-    Configuration discovery walks up from the executable first, so a binary left
-    in the build checkout resolves the checkout's own `orchestration/integrations.json`
-    and the run validates the checkout instead of the bundle under acceptance —
-    the exact false PASS the out-of-checkout `cwd` was meant to prevent. An
-    installed consumer has the binary in `<root>/bin` and the configuration in a
-    separate home, so the acceptance stages that same topology before probing.
+    Configuration discovery walks up from the executable before it consults
+    `CODE_INTEL_HOME`, so a binary left in the build checkout resolves the
+    checkout's own `orchestration/integrations.json` and the run validates the
+    checkout instead of the bundle under acceptance — the exact false PASS the
+    out-of-checkout `cwd` was meant to prevent.
     """
     source = Path(path)
-    target = work / "bin" / source.name
+    target = bin_dir / source.name
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
     return str(target.resolve())
+
+
+def consumer_root(work: Path) -> Path:
+    """A consumer installation: the tracked source tree, minus its own configuration.
+
+    An installed consumer has the repository (the release archive ships it), and
+    `orchestrate Validate` resolves every integration entrypoint under the
+    manifest's root — the doctor capability fails the whole run when one is
+    missing. A configuration package alone can therefore never complete a normal
+    run, which is a property of the product, not a gap this acceptance may paper
+    over. The archive's own `orchestration/` is removed so the only manifest
+    discovery can resolve is the one the bundle writes.
+    """
+    root = work / "consumer"
+    archive = subprocess.run(
+        ["git", "archive", "--format=tar", "HEAD"],
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+    ).stdout
+    root.mkdir(parents=True, exist_ok=False)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tree:
+        for member in tree.getmembers():
+            if not member.name or member.name.startswith("/") or ".." in Path(member.name).parts:
+                fail(f"git archive produced an unsafe member: {member.name}")
+            destination = root / member.name
+            if member.isdir():
+                destination.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                fail(f"git archive produced a non-regular member: {member.name}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(tree.extractfile(member).read())  # type: ignore[union-attr]
+    shutil.rmtree(root / "orchestration")
+    return root
 
 
 def extract_configs_bundle(bundle: Path, target: Path) -> None:
@@ -859,7 +893,8 @@ def configs_acceptance(args: argparse.Namespace) -> None:
     request_template = read_json(fixture / "evidence-request.json")
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
-    executable = stage_executable(configs_binary(args.binary), work)
+    bare = stage_executable(configs_binary(args.binary), work / "bin")
+    executable = bare
     checks: list[dict[str, Any]] = []
     report: dict[str, Any] = {
         "schema": CONFIGS_ACCEPTANCE_SCHEMA,
@@ -901,15 +936,25 @@ def configs_acceptance(args: argparse.Namespace) -> None:
             fail(f"fixture preparation failed ({' '.join(command)}): {completed.stderr.strip()}")
 
     if args.bundle:
-        config_home = work / "config-home"
-        extract_configs_bundle(Path(args.bundle).resolve(), config_home)
-        expected = str((config_home / "orchestration" / "integrations.json").resolve())
+        root = consumer_root(work)
+        bundle_home = work / "bundle"
+        extract_configs_bundle(Path(args.bundle).resolve(), bundle_home)
+        for entry in bundle_home.iterdir():
+            target = root / entry.name
+            if entry.is_dir():
+                shutil.copytree(entry, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(entry, target)
+        executable = stage_executable(configs_binary(args.binary), root / "bin")
+        expected = str((root / "orchestration" / "integrations.json").resolve())
 
-        def resolved_manifest(home: str | None) -> tuple[int, str | None, str]:
+        def resolved_manifest(
+            home: str | None, binary: str | None = None
+        ) -> tuple[int, str | None, str]:
             environment = env if home is None else {**env, "CODE_INTEL_HOME": home}
             plan = subprocess.run(
                 [
-                    executable,
+                    binary or executable,
                     "orchestrate",
                     "--action",
                     "List",
@@ -927,28 +972,32 @@ def configs_acceptance(args: argparse.Namespace) -> None:
             except json.JSONDecodeError:
                 return plan.returncode, None, plan.stderr
 
-        # The bundle must win discovery; `orchestrate` validates entrypoints and
-        # the config surface deliberately ships no Rust source, so only the
-        # reported manifest path is asserted, not `ok`.
-        _, resolved, _ = resolved_manifest(str(config_home))
-        env["CODE_INTEL_HOME"] = str(config_home)
+        # The consumer root has no `orchestration/` of its own, so a manifest that
+        # resolves under it can only be the bundle's — and it must not be the
+        # build checkout's, which discovery would reach through the binary's own
+        # compile-time fallback.
+        _, resolved, _ = resolved_manifest(str(root))
+        resolved_path = Path(resolved).resolve() if resolved else None
+        outside_checkout = bool(resolved_path) and ROOT.resolve() not in resolved_path.parents
+        env["CODE_INTEL_HOME"] = str(root)
         # Negative control: a home that is not a code-intel root must leave the
-        # run with nothing to read. The staged binary cannot find a manifest by
-        # walking (neither its bin directory nor the acceptance work directory is
-        # a code-intel root), so CODE_INTEL_HOME is the only source left and an
-        # empty one has to fail instead of silently resolving something else.
+        # run with nothing to read. The bare binary sits outside every code-intel
+        # root (neither the acceptance work directory nor its parents is one), so
+        # CODE_INTEL_HOME is the only source left and an empty one has to fail
+        # instead of silently resolving something else.
         empty_home = work / "empty-home"
         empty_home.mkdir()
-        empty_code, _, empty_stderr = resolved_manifest(str(empty_home))
+        empty_code, _, empty_stderr = resolved_manifest(str(empty_home), bare)
         checks.append(
             {
                 "name": "configuration-home",
                 "ok": resolved == expected
+                and outside_checkout
                 and empty_code != 0
                 and "orchestration/integrations.json" in empty_stderr,
                 "detail": (
-                    f"resolved={resolved} expected={expected}; empty-home exit={empty_code} "
-                    f"stderr={empty_stderr.strip()[:160]}"
+                    f"resolved={resolved} expected={expected} outsideCheckout={outside_checkout}; "
+                    f"empty-home exit={empty_code} stderr={empty_stderr.strip()[:160]}"
                 ),
             }
         )

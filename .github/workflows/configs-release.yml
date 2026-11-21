@@ -157,9 +157,9 @@ jobs:
             --out dist \
             --asset scripts/verify_configs_release.py
 
-      # Acceptance runs against the extracted bundle, from a working directory
-      # outside the checkout, so a run that silently falls back to the build
-      # checkout fails instead of passing.
+      # Acceptance runs from a working directory outside the checkout, against a
+      # staged consumer installation, so a run that silently falls back to the
+      # build checkout fails instead of passing.
       - name: Accept the contract with the built binary
         run: |
           python3 .github/scripts/ci.py configs-acceptance \
@@ -168,6 +168,17 @@ jobs:
             --work "$RUNNER_TEMP/configs-acceptance" \
             --out dist/acceptance.json \
             --tag "${{ steps.target.outputs.tag }}"
+
+      # The acceptance work directory holds the consumer installation the run
+      # used and the run's own stdout, so a failure is diagnosable from the run's
+      # artifacts instead of from a bare exit code (issue #389).
+      - name: Upload the acceptance work directory
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: configs-acceptance-work
+          path: ${{ runner.temp }}/configs-acceptance
+          if-no-files-found: ignore
 
       # Repackage so the manifest digests the acceptance report too; the bundle
       # is reproducible, so it is byte-identical to the one acceptance read.
