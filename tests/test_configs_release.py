@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -260,6 +261,26 @@ class CompatibilityGateTests(unittest.TestCase):
         for bad in ("v0.1.0", "configs-v0.1", "configs-v01.1.0"):
             with self.assertRaises(verifier.VerificationError):
                 verifier.expected_asset_names(bad)
+
+
+class AcceptancePathTests(unittest.TestCase):
+    """The acceptance must resolve the binary before it runs anything elsewhere."""
+
+    def test_a_relative_binary_becomes_absolute(self) -> None:
+        # Regression: CI passed `--binary target/release/code-intel` while the
+        # acceptance runs its subprocesses with cwd outside the checkout, so the
+        # relative path resolved to nothing and the job died with FileNotFoundError.
+        with tempfile.TemporaryDirectory() as temporary:
+            fake = Path(temporary) / "code-intel"
+            fake.write_text("x", encoding="utf-8")
+            resolved = ci.configs_binary(str(fake))
+            self.assertTrue(os.path.isabs(resolved))
+            self.assertEqual(Path(resolved), fake.resolve())
+
+    def test_a_missing_binary_names_the_resolved_path(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            ci.configs_binary("target/release/does-not-exist")
+        self.assertIn("code-intel binary missing", str(caught.exception))
 
 
 if __name__ == "__main__":

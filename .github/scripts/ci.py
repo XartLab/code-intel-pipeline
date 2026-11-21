@@ -790,6 +790,19 @@ def package_configs(args: argparse.Namespace) -> None:
     )
 
 
+def configs_binary(path: str) -> str:
+    """Absolute path to the binary under acceptance.
+
+    The acceptance runs its subprocesses with `cwd=` outside the checkout (so a
+    run that falls back to the build checkout fails), which makes a relative
+    `--binary` resolve against the wrong directory.
+    """
+    resolved = Path(path).resolve()
+    if not resolved.is_file():
+        fail(f"code-intel binary missing: {resolved}")
+    return str(resolved)
+
+
 def extract_configs_bundle(bundle: Path, target: Path) -> None:
     """Expand the bundle for a run, refusing anything but regular files with safe names."""
     target.mkdir(parents=True, exist_ok=False)
@@ -825,7 +838,7 @@ def configs_acceptance(args: argparse.Namespace) -> None:
     verifier = configs_verifier()
     fixture = Path(args.fixture).resolve()
     request_template = read_json(fixture / "evidence-request.json")
-    executable = args.binary
+    executable = configs_binary(args.binary)
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
     checks: list[dict[str, Any]] = []
