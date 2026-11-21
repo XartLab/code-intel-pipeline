@@ -935,6 +935,49 @@ def configs_acceptance(args: argparse.Namespace) -> None:
         if completed.returncode != 0:
             fail(f"fixture preparation failed ({' '.join(command)}): {completed.stderr.strip()}")
 
+    # DR-0016: an ungoverned repository has no Sentrux admission at all — the
+    # gate verdict is `unknown`, not `pass` — so a normal run can only complete
+    # on a repository that carries a baseline. Generate it with the binary under
+    # acceptance and commit it so the snapshot stays clean.
+    baseline = subprocess.run(
+        [
+            executable,
+            "sentrux",
+            "--operation",
+            "save_baseline",
+            "--repo",
+            str(repo_dir),
+            "--json",
+        ],
+        cwd=work,
+        capture_output=True,
+        text=True,
+    )
+    if baseline.returncode != 0:
+        fail(
+            "sentrux baseline generation failed: "
+            f"{baseline.stderr.strip()[:400] or baseline.stdout.strip()[:400]}"
+        )
+    for command in (
+        ["git", "add", "-A"],
+        # The baseline is the point of the exercise; a developer's global ignore
+        # for `.sentrux/` must not quietly drop it and leave the snapshot dirty.
+        ["git", "add", "-f", ".sentrux/baseline.json"],
+        [
+            "git",
+            "-c",
+            "user.name=code-intel-configs-ci",
+            "-c",
+            "user.email=ci@example.invalid",
+            "commit",
+            "-qm",
+            "sentrux baseline for the configs acceptance fixture",
+        ],
+    ):
+        completed = subprocess.run(command, cwd=repo_dir, capture_output=True, text=True)
+        if completed.returncode != 0:
+            fail(f"fixture baseline commit failed ({' '.join(command)}): {completed.stderr.strip()}")
+
     if args.bundle:
         root = consumer_root(work)
         bundle_home = work / "bundle"
