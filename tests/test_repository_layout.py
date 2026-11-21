@@ -40,7 +40,7 @@ class RepositoryLayoutTests(unittest.TestCase):
         )
 
     def test_pipeline_workflows_checkout_complete_git_history(self) -> None:
-        for name in ("ci.yml", "release.yml"):
+        for name in ("ci.yml", "release.yml", "configs-release.yml"):
             with self.subTest(name=name):
                 text = (ROOT / ".github" / "workflows" / name).read_text(
                     encoding="utf-8"

@@ -1,0 +1,337 @@
+name: code-intel-configs-release
+
+# Publishes the `configs-v*` configuration baseline (issue #389). Merging a
+# change to configs/version.json is the release authorization: the version file
+# is the only thing that names a new baseline, so a merge cannot ship one by
+# accident and a reviewer sees the version change in the diff.
+#
+# A signed tag is the stronger policy the binary line uses
+# (docs/RELEASE_SIGNING.md); this line deliberately accepts the weaker one and
+# says so in docs/configs-release.md, because a configuration baseline is
+# integrity-checked by the consumer verifier rather than by a signing key.
+#
+# Triggers:
+#   push to main (configs surface touched) -> build, accept, publish, verify
+#   pull_request (same paths)              -> the same gate as a dry run, no write token
+#   workflow_dispatch                      -> re-run for the current version file, main only
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "configs/version.json"
+      - ".github/workflows/configs-release.yml"
+      - ".github/scripts/ci.py"
+      - "scripts/verify_configs_release.py"
+      - "tests/fixtures/configs-baseline/**"
+      - "tests/test_configs_release.py"
+      - "orchestration/**"
+      - "templates/**"
+      - "overlays/**"
+      - "skills/**"
+      - "pipeline.config.json"
+      - "pipeline.config.example.json"
+  pull_request:
+    paths:
+      - "configs/version.json"
+      - ".github/workflows/configs-release.yml"
+      - ".github/scripts/ci.py"
+      - "scripts/verify_configs_release.py"
+      - "tests/fixtures/configs-baseline/**"
+      - "tests/test_configs_release.py"
+      - "orchestration/**"
+      - "templates/**"
+      - "overlays/**"
+      - "skills/**"
+      - "pipeline.config.json"
+      - "pipeline.config.example.json"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "configs-v<semver> to publish; defaults to configs/version.json"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Two runs of one version must not race to publish the same tag.
+concurrency:
+  group: configs-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  configs-gate:
+    name: Build the binary, accept the contract, verify the inventory
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    outputs:
+      tag: ${{ steps.target.outputs.tag }}
+      version: ${{ steps.target.outputs.version }}
+      publish: ${{ steps.target.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Install pinned ripgrep
+        run: python3 .github/scripts/ci.py install-tool rg
+
+      # Only a main commit may publish. A dispatch from any other ref runs the
+      # gate and then stops, so a branch cannot become a release source.
+      - name: Resolve the release target
+        id: target
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+
+          declared = json.loads(Path("configs/version.json").read_text(encoding="utf-8"))["configsVersion"]
+          requested = os.environ.get("INPUT_TAG", "").strip()
+          tag = requested or f"configs-v{declared}"
+          match = re.fullmatch(r"configs-v(\d+\.\d+\.\d+)", tag)
+          if not match:
+              raise SystemExit(f"unsupported tag: {tag}")
+          if requested and match.group(1) != declared:
+              raise SystemExit(f"tag {tag} does not match the declared configsVersion {declared}")
+
+          existing = subprocess.run(
+              ["gh", "release", "view", tag, "--json", "isDraft"],
+              capture_output=True, text=True,
+          )
+          draft = json.loads(existing.stdout)["isDraft"] if existing.returncode == 0 else False
+          on_main = os.environ["GITHUB_REF"] == "refs/heads/main"
+          publish = (
+              os.environ["GITHUB_EVENT_NAME"] in ("push", "workflow_dispatch")
+              and on_main
+              and (existing.returncode != 0 or draft)
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"tag={tag}\nversion={match.group(1)}\n")
+              handle.write(f"publish={'true' if publish else 'false'}\n")
+          print(
+              f"tag={tag} on_main={on_main} exists={existing.returncode == 0} "
+              f"draft={draft} publish={publish}"
+          )
+          PY
+
+      - name: configs contract tests
+        run: python3 tests/test_configs_release.py -v
+
+      - name: Build the code-intel binary
+        run: cargo build -p code-intel --release --locked
+
+      - name: Package the configuration baseline
+        run: |
+          python3 .github/scripts/ci.py package-configs \
+            --tag "${{ steps.target.outputs.tag }}" \
+            --out dist \
+            --asset scripts/verify_configs_release.py
+
+      # Acceptance runs against the extracted bundle, from a working directory
+      # outside the checkout, so a run that silently falls back to the build
+      # checkout fails instead of passing.
+      - name: Accept the contract with the built binary
+        run: |
+          python3 .github/scripts/ci.py configs-acceptance \
+            --binary target/release/code-intel \
+            --bundle "dist/code-intel-configs-${{ steps.target.outputs.version }}.tar.gz" \
+            --work "$RUNNER_TEMP/configs-acceptance" \
+            --out dist/acceptance.json \
+            --tag "${{ steps.target.outputs.tag }}"
+
+      # Repackage so the manifest digests the acceptance report too; the bundle
+      # is reproducible, so it is byte-identical to the one acceptance read.
+      - name: Repackage with the acceptance report
+        run: |
+          python3 .github/scripts/ci.py package-configs \
+            --tag "${{ steps.target.outputs.tag }}" \
+            --out dist \
+            --asset scripts/verify_configs_release.py \
+            --asset dist/acceptance.json
+
+      - name: Verify the assembled inventory without the network
+        run: |
+          python3 scripts/verify_configs_release.py \
+            --tag "${{ steps.target.outputs.tag }}" \
+            --dist dist \
+            --expect-commit "$GITHUB_SHA" \
+            --no-source
+
+      - name: Upload the configs inventory
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: configs-dist
+          path: dist
+          if-no-files-found: error
+
+  configs-publish:
+    name: Publish, verify from a clean directory, promote
+    needs: configs-gate
+    if: ${{ needs.configs-gate.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # The only job that may write, and it never builds or validates: every
+    # check already passed in configs-gate.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout the verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the configs inventory
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: configs-dist
+          path: dist
+
+      - name: Attest the bundle
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/code-intel-configs-*.tar.gz
+
+      - name: Render the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+
+          manifest = json.loads(
+              next(Path("dist").glob("code-intel-configs-*.manifest.json")).read_text(encoding="utf-8")
+          )
+          compat = manifest["codeIntel"]
+          listed = subprocess.run(
+              ["gh", "release", "list", "--limit", "40", "--json", "tagName"],
+              capture_output=True, text=True, check=True,
+          ).stdout
+          tags = [entry["tagName"] for entry in json.loads(listed) if entry["tagName"].startswith("v")]
+          classified = json.loads(subprocess.run(
+              ["python3", "scripts/verify_configs_release.py", "--classify",
+               "--against", "configs/version.json", "--versions", *tags],
+              capture_output=True, text=True, check=True,
+          ).stdout)
+          satisfying = [row["version"] for row in classified["versions"] if row["satisfies"]]
+          run_url = (
+              f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+              f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          )
+          checked = ", ".join(f"`{tag}`" for tag in tags) or "none"
+          if satisfying:
+              verdict = "Satisfying the declared range: " + ", ".join(f"`{t}`" for t in satisfying)
+          else:
+              verdict = (
+                  "**None of them satisfies it**, so a consumer must cut or install a binary "
+                  f"release containing the fix before the acceptance run can pass; the config "
+                  "package alone cannot unblock it."
+              )
+          lines = [
+              "## code-intel configuration baseline",
+              "",
+              f"Producer commit: `{manifest['producer']['commit']}`",
+              f"Bundle: `{manifest['bundle']['name']}` — {manifest['bundle']['fileCount']} files, "
+              f"sha256 `{manifest['bundle']['sha256']}`",
+              "",
+              "## Binary prerequisite",
+              "",
+              "This package does **not** repair a binary. It requires a Code Intel binary containing the",
+              "[issue #123](https://github.com/XartLab/code-intel-pipeline/issues/123) fix (commit `d131f3f`),",
+              f"declared as `>= {compat['minVersion']}, < {compat.get('maxExclusive')}` under SemVer",
+              f"precedence. {compat['note']}",
+              "",
+              f"Published releases checked against that range: {checked}. {verdict}.",
+              "",
+              "## Verify it yourself",
+              "",
+              "```bash",
+              f"python scripts/verify_configs_release.py --tag {manifest['tag']} \\",
+              '    --dir "$(mktemp -d)" --code-intel "$(command -v code-intel)"',
+              "```",
+              "",
+              "The verifier exits non-zero when the installed binary is outside the declared range, when an",
+              "asset digest drifts, or when the bundle differs from the repository at the producer commit.",
+              "",
+              f"Verified by [run {os.environ['GITHUB_RUN_ID']}]({run_url}); its log and the acceptance",
+              "report are attached to that run.",
+              "",
+          ]
+          Path("release-notes.md").write_text("\n".join(lines), encoding="utf-8")
+          print("\n".join(lines))
+          PY
+
+      - name: Stage the release as a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.configs-gate.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" dist/* \
+              --draft --target "$GITHUB_SHA" --title "$TAG" --notes-file release-notes.md
+          fi
+
+      - name: Upload the assets without clobbering
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.configs-gate.outputs.tag }}
+        run: |
+          assets=()
+          for file in dist/*; do assets+=("$file"); done
+          gh release upload "$TAG" "${assets[@]}"
+
+      # A draft release is never a deliverable: it is only a staging area so a
+      # failed clean-room verification cannot leave a public release behind.
+      - name: Verify the staged release from an empty directory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.configs-gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          python3 scripts/verify_configs_release.py \
+            --tag "$TAG" --dir "$work/download" \
+            --expect-commit "$GITHUB_SHA" 2>&1 | tee "$RUNNER_TEMP/verify.log"
+
+      - name: Promote the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.configs-gate.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false
+
+      - name: Upload the verification log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: configs-publish-log
+          path: ${{ runner.temp }}/verify.log
+          if-no-files-found: ignore

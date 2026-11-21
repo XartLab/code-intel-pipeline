@@ -9,6 +9,8 @@ step's error.
 from __future__ import annotations
 
 import argparse
+import gzip
+import importlib.util
 import hashlib
 import io
 import json
@@ -613,6 +615,430 @@ def verify_inventory(args: argparse.Namespace) -> None:
         print(f"verified {zip_path.name} sha256={digest}")
 
 
+# --- configs release --------------------------------------------------------
+
+
+CONFIGS_BUNDLE_STEM = "code-intel-configs"
+CONFIGS_VERSION_FILE = ROOT / "configs" / "version.json"
+CONFIGS_VERIFIER = ROOT / "scripts" / "verify_configs_release.py"
+CONFIGS_ACCEPTANCE_SCHEMA = "code-intel-configs-acceptance.v1"
+# The committed configuration surface a `configs-v*` release certifies. Rust
+# source, tests, docs and the host-local factory/eval assets are not
+# configuration: a consumer pins this set, not the implementation.
+# `pipeline.config.json` carries the producer's own `repos` overrides; a
+# consumer replaces those with its own and is told so in the release notes.
+CONFIGS_SURFACE = (
+    "orchestration",
+    "overlays",
+    "pipeline.config.example.json",
+    "pipeline.config.json",
+    "skills",
+    "templates",
+)
+
+
+def git_stdout(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def configs_document() -> dict[str, Any]:
+    """The one source of truth for the configs version and its Code Intel range."""
+    if not CONFIGS_VERSION_FILE.is_file():
+        fail(f"missing {CONFIGS_VERSION_FILE.relative_to(ROOT)}")
+    document = read_json(CONFIGS_VERSION_FILE)
+    if document.get("schema") != "code-intel-configs-version.v1":
+        fail(f"configs/version.json has an unsupported schema: {document.get('schema')!r}")
+    version = document.get("configsVersion")
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        fail(f"configs/version.json declares an invalid configsVersion: {version!r}")
+    compat = document.get("codeIntel")
+    if not isinstance(compat, dict) or not isinstance(compat.get("minVersion"), str):
+        fail("configs/version.json declares no codeIntel.minVersion")
+    return document
+
+
+def configs_verifier() -> Any:
+    """Load the consumer verifier so one implementation owns the compatibility gate."""
+    if not CONFIGS_VERIFIER.is_file():
+        fail(f"missing {CONFIGS_VERIFIER.relative_to(ROOT)}")
+    spec = importlib.util.spec_from_file_location("verify_configs_release", CONFIGS_VERIFIER)
+    if spec is None or spec.loader is None:
+        fail(f"cannot load {CONFIGS_VERIFIER.relative_to(ROOT)}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def configs_archive(version: str) -> tuple[bytes, list[dict[str, Any]]]:
+    """A reproducible tar.gz of the committed configuration surface, plus its inventory."""
+    prefix = f"{CONFIGS_BUNDLE_STEM}-{version}"
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "--", *CONFIGS_SURFACE],
+        cwd=ROOT, capture_output=True, check=True,
+    ).stdout.decode("utf-8", "surrogateescape")
+    paths = sorted(name for name in listed.split("\0") if name)
+    if not paths:
+        fail("the configured configuration surface contains no tracked files")
+    tarball = subprocess.run(
+        ["git", "archive", "--format=tar", f"--prefix={prefix}/", "HEAD", "--", *paths],
+        cwd=ROOT, capture_output=True, check=True,
+    ).stdout
+    buffer = io.BytesIO()
+    # `mtime=0` and no source name keep the gzip header reproducible, and the
+    # members keep git's own metadata, so two runs on one commit agree.
+    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0, filename="") as stream:
+        stream.write(tarball)
+    archive = buffer.getvalue()
+    members: list[dict[str, Any]] = []
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tree:
+        for member in tree.getmembers():
+            if member.isdir():
+                continue
+            if not member.isfile():
+                fail(f"the configuration surface contains a non-regular member: {member.name}")
+            relative = member.name[len(prefix) + 1 :]
+            if not relative or relative.startswith("/") or ".." in Path(relative).parts:
+                fail(f"the configuration surface contains an unsafe member name: {member.name}")
+            data = tree.extractfile(member).read()  # type: ignore[union-attr]
+            members.append(
+                {
+                    "path": relative,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data),
+                }
+            )
+    if len(members) != len(paths):
+        fail(f"the archive holds {len(members)} files but git lists {len(paths)}")
+    return archive, members
+
+
+def package_configs(args: argparse.Namespace) -> None:
+    """Assemble the `configs-v*` inventory: bundle, manifest, sidecar, extra assets.
+
+    Everything is built from `git archive HEAD`, never the working tree, so no
+    earlier CI step can change what ships. The manifest digests every bundled
+    file; the sidecar then digests the bundle, the manifest and every extra
+    asset, so a consumer can detect drift without trusting this script.
+    """
+    document = configs_document()
+    version = document["configsVersion"]
+    match = re.fullmatch(r"configs-v([0-9]+\.[0-9]+\.[0-9]+)", args.tag)
+    if not match:
+        fail(f"unsupported tag: {args.tag} (expected configs-v<semver>)")
+    if match.group(1) != version:
+        fail(f"tag {args.tag} does not match the declared configsVersion {version}")
+    archive, members = configs_archive(version)
+
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    bundle_path = out / f"{CONFIGS_BUNDLE_STEM}-{version}.tar.gz"
+    bundle_path.write_bytes(archive)
+
+    assets: list[dict[str, Any]] = []
+    for item in args.asset or []:
+        source = Path(item)
+        if not source.is_file():
+            fail(f"--asset {item} is not a file")
+        target = out / source.name
+        if source.resolve() != target.resolve():
+            shutil.copyfile(source, target)
+        if target.name in {bundle_path.name, f"{CONFIGS_BUNDLE_STEM}-{version}.manifest.json"}:
+            fail(f"--asset {item} collides with a generated asset name")
+        assets.append(
+            {"name": target.name, "sha256": sha256(target), "bytes": target.stat().st_size}
+        )
+
+    manifest = {
+        "schema": "code-intel-configs-manifest.v1",
+        "configsVersion": version,
+        "tag": args.tag,
+        "producer": {
+            "commit": git_stdout("rev-parse", "HEAD"),
+            "tree": git_stdout("rev-parse", "HEAD^{tree}"),
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "workflow": ".github/workflows/configs-release.yml",
+        },
+        "codeIntel": document["codeIntel"],
+        "bundle": {
+            "name": bundle_path.name,
+            "sha256": sha256(bundle_path),
+            "bytes": len(archive),
+            "fileCount": len(members),
+            "files": members,
+        },
+        "assets": assets,
+    }
+    manifest_path = out / f"{CONFIGS_BUNDLE_STEM}-{version}.manifest.json"
+    manifest_bytes = (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    manifest_path.write_bytes(manifest_bytes)
+
+    sidecar = [f"{sha256(bundle_path)} *{bundle_path.name}"]
+    sidecar.append(f"{hashlib.sha256(manifest_bytes).hexdigest()} *{manifest_path.name}")
+    sidecar += [f"{entry['sha256']} *{entry['name']}" for entry in assets]
+    (out / f"{CONFIGS_BUNDLE_STEM}-{version}.sha256").write_text(
+        "\n".join(sidecar) + "\n", encoding="ascii"
+    )
+
+    github_file("GITHUB_OUTPUT", f"tag={args.tag}")
+    github_file("GITHUB_OUTPUT", f"bundle={bundle_path}")
+    github_file("GITHUB_OUTPUT", f"manifest={manifest_path}")
+    print(
+        f"packaged {bundle_path.name} ({len(members)} files, sha256={manifest['bundle']['sha256']}) "
+        f"with {len(assets)} extra asset(s)"
+    )
+
+
+def extract_configs_bundle(bundle: Path, target: Path) -> None:
+    """Expand the bundle for a run, refusing anything but regular files with safe names."""
+    target.mkdir(parents=True, exist_ok=False)
+    with tarfile.open(bundle, mode="r:gz") as tree:
+        for member in tree.getmembers():
+            if member.isdir():
+                continue
+            relative = member.name.split("/", 1)[1] if "/" in member.name else ""
+            if (
+                not member.isfile()
+                or not relative
+                or relative.startswith("/")
+                or ".." in Path(relative).parts
+            ):
+                fail(f"bundle contains an unsafe member: {member.name}")
+            destination = target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(tree.extractfile(member).read())  # type: ignore[union-attr]
+
+
+def configs_acceptance(args: argparse.Namespace) -> None:
+    """Accept the release contract from a consumer's side.
+
+    Three things have to hold at once: the extracted bundle is the configuration
+    the binary actually resolves (`orchestrate validate` names the manifest it
+    read), a normal-mode run on a representative repository completes with its
+    readable artifacts, and an evidence payload between the historical 8 MiB
+    default and the 64 MiB contract budget is admitted while one beyond the
+    budget is still refused.
+    """
+    document = configs_document()
+    compat = document["codeIntel"]
+    verifier = configs_verifier()
+    fixture = Path(args.fixture).resolve()
+    request_template = read_json(fixture / "evidence-request.json")
+    executable = args.binary
+    work = Path(args.work).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    checks: list[dict[str, Any]] = []
+    report: dict[str, Any] = {
+        "schema": CONFIGS_ACCEPTANCE_SCHEMA,
+        "tag": args.tag or f"configs-v{document['configsVersion']}",
+        "producer": {"commit": git_stdout("rev-parse", "HEAD")},
+        "acceptedAt": datetime.now(timezone.utc).isoformat(),
+        "checks": checks,
+    }
+
+    version = verifier.binary_version(executable)
+    satisfies, reason = verifier.compatibility_verdict(version, compat)
+    report["producer"]["codeIntelVersion"] = version
+    checks.append(
+        {"name": "code-intel-version", "ok": satisfies, "detail": f"{executable}: {reason}"}
+    )
+
+    env = os.environ.copy()
+    env.pop("CODE_INTEL_INTEGRATIONS_MANIFEST", None)
+    repo_dir = work / "repo"
+    shutil.copytree(fixture / "repo", repo_dir)
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "add", "-A"],
+        [
+            "git",
+            "-c",
+            "user.name=code-intel-configs-ci",
+            "-c",
+            "user.email=ci@example.invalid",
+            "commit",
+            "-qm",
+            "configs baseline fixture",
+        ],
+    ):
+        completed = subprocess.run(command, cwd=repo_dir, capture_output=True, text=True)
+        if completed.returncode != 0:
+            fail(f"fixture preparation failed ({' '.join(command)}): {completed.stderr.strip()}")
+
+    if args.bundle:
+        config_home = work / "config-home"
+        extract_configs_bundle(Path(args.bundle).resolve(), config_home)
+        env["CODE_INTEL_HOME"] = str(config_home)
+        plan = subprocess.run(
+            [
+                executable,
+                "orchestrate",
+                "validate",
+                "--action",
+                "Validate",
+                "--repo",
+                str(repo_dir),
+                "--json",
+            ],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        resolved = None
+        try:
+            resolved = json.loads(plan.stdout).get("manifest")
+        except json.JSONDecodeError:
+            resolved = None
+        expected = str((config_home / "orchestration" / "integrations.json").resolve())
+        checks.append(
+            {
+                "name": "configuration-home",
+                "ok": plan.returncode == 0 and resolved == expected,
+                "detail": f"resolved={resolved} expected={expected}",
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "configuration-home",
+                "ok": False,
+                "detail": "no --bundle was given, so the run would validate the build checkout",
+            }
+        )
+
+    run_dir = work / "normal"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [executable, str(repo_dir), "--mode", "normal", "--json"],
+        cwd=run_dir,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        result = None
+    result = result or {}
+    checks.append(
+        {
+            "name": "normal-run",
+            "ok": completed.returncode == 0
+            and result.get("outcome") == "completed"
+            and result.get("exitCode") == 0
+            and result.get("failureNode") is None,
+            "detail": (
+                f"exit={completed.returncode} outcome={result.get('outcome')} "
+                f"failureNode={result.get('failureNode')} diagnostic={result.get('diagnostic')}"
+            ),
+        }
+    )
+    readable = result.get("readableArtifacts") or {}
+    missing = [
+        name
+        for name in ("agentCodeSliceRanking", "hospitalMarkdown")
+        if not Path(str(readable.get(name) or "")).is_file()
+    ]
+    checks.append(
+        {
+            "name": "normal-run-readable-artifacts",
+            "ok": bool(readable) and not missing,
+            "detail": f"missing={missing} readable={sorted(readable)}",
+        }
+    )
+
+    def evidence_case(name: str, payload: bytes) -> None:
+        case = work / name
+        case.mkdir(parents=True, exist_ok=True)
+        request = json.loads(json.dumps(request_template))
+        request["observation"]["payload"]["sha256"] = hashlib.sha256(payload).hexdigest()
+        (case / "payload.json").write_bytes(payload)
+        (case / "request.json").write_text(
+            json.dumps(request, separators=(",", ":")), encoding="utf-8"
+        )
+        run = subprocess.run(
+            [
+                executable,
+                "evidence",
+                "validate",
+                "--request",
+                str(case / "request.json"),
+                "--artifact-root",
+                str(case),
+            ],
+            cwd=work,
+            capture_output=True,
+            text=True,
+        )
+        try:
+            outcome = json.loads(run.stdout)
+        except json.JSONDecodeError:
+            outcome = {}
+        checks.append(
+            {
+                "name": name,
+                "ok": run.returncode == 0
+                and outcome.get("status") == "admitted"
+                and outcome.get("domainVerdict") == "observed",
+                "detail": (
+                    f"payload={len(payload)} bytes exit={run.returncode} "
+                    f"status={outcome.get('status')} "
+                    f"diagnostics={(outcome.get('diagnostics') or run.stderr.strip())[:200]}"
+                ),
+            }
+        )
+
+    evidence_case("evidence-payload-10MiB", b'{"schema":"code-intel-evidence-payload.v1","data":{"padding":"' + b"a" * (10 * 1024 * 1024) + b'"}}')
+
+    oversize = work / "evidence-payload-oversize"
+    oversize.mkdir(parents=True, exist_ok=True)
+    oversized = b'{"schema":"code-intel-evidence-payload.v1","data":{"padding":"' + b"a" * (64 * 1024 * 1024 + 1024) + b'"}}'
+    request = json.loads(json.dumps(request_template))
+    request["observation"]["payload"]["sha256"] = hashlib.sha256(oversized).hexdigest()
+    (oversize / "payload.json").write_bytes(oversized)
+    (oversize / "request.json").write_text(json.dumps(request, separators=(",", ":")), encoding="utf-8")
+    run = subprocess.run(
+        [
+            executable,
+            "evidence",
+            "validate",
+            "--request",
+            str(oversize / "request.json"),
+            "--artifact-root",
+            str(oversize),
+        ],
+        cwd=work,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        outcome = json.loads(run.stdout)
+    except json.JSONDecodeError:
+        outcome = {}
+    checks.append(
+        {
+            "name": "evidence-payload-beyond-contract",
+            "ok": run.returncode != 0 and outcome.get("status") != "admitted",
+            "detail": (
+                f"payload={len(oversized)} bytes exit={run.returncode} "
+                f"status={outcome.get('status')} stderr={run.stderr.strip()[:200]}"
+            ),
+        }
+    )
+
+    out = Path(args.out).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    failed = [check for check in checks if not check["ok"]]
+    for check in failed:
+        print(f"::error title=configs-acceptance::{check['name']}: {check['detail']}")
+    if failed:
+        fail("configs acceptance failed: " + ", ".join(check["name"] for check in failed))
+    print(f"configs acceptance passed: {len(checks)} checks, code-intel {version}")
+
+
 # --- release-tag ------------------------------------------------------------
 
 
@@ -677,6 +1103,21 @@ def main() -> None:
     command.add_argument("--tag", required=True)
     command.add_argument("--commit")
     command.set_defaults(handler=verify_inventory)
+    command = commands.add_parser("package-configs")
+    command.add_argument("--tag", required=True)
+    command.add_argument("--out", default="dist")
+    command.add_argument("--asset", action="append", default=[])
+    command.set_defaults(handler=package_configs)
+
+    command = commands.add_parser("configs-acceptance")
+    command.add_argument("--binary", required=True)
+    command.add_argument("--bundle")
+    command.add_argument("--fixture", default="tests/fixtures/configs-baseline")
+    command.add_argument("--work", required=True)
+    command.add_argument("--out", required=True)
+    command.add_argument("--tag")
+    command.set_defaults(handler=configs_acceptance)
+
 
     command = commands.add_parser("release-tag")
     command.add_argument("--tag", required=True)

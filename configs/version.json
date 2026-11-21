@@ -1,0 +1,11 @@
+{
+  "schema": "code-intel-configs-version.v1",
+  "configsVersion": "0.1.0",
+  "codeIntel": {
+    "minVersion": "0.7.2-beta.7",
+    "maxExclusive": "0.8.0",
+    "requiresIssue": 123,
+    "requiresFix": true,
+    "note": "The 8 MiB evidence-payload boundary is fixed by commit d131f3f (PR #407, issue #123). No published Code Intel binary contains that fix yet: v0.7.1 and v0.7.2-beta.6 predate it. A binary outside [minVersion, maxExclusive) must be refused, not silently accepted."
+  }
+}
