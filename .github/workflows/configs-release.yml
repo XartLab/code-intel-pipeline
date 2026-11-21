@@ -254,9 +254,13 @@ jobs:
               capture_output=True, text=True, check=True,
           ).stdout
           tags = [entry["tagName"] for entry in json.loads(listed) if entry["tagName"].startswith("v")]
+          # The verifier compares bare SemVer; a `v` prefix is the release tag's
+          # spelling, and passing it through would make every published binary
+          # read as "not a supported version" — a false "none satisfies".
           classified = json.loads(subprocess.run(
               ["python3", "scripts/verify_configs_release.py", "--classify",
-               "--against", "configs/version.json", "--versions", *tags],
+               "--against", "configs/version.json",
+               "--versions", *[tag.removeprefix("v") for tag in tags]],
               capture_output=True, text=True, check=True,
           ).stdout)
           satisfying = [row["version"] for row in classified["versions"] if row["satisfies"]]
@@ -266,7 +270,7 @@ jobs:
           )
           checked = ", ".join(f"`{tag}`" for tag in tags) or "none"
           if satisfying:
-              verdict = "Satisfying the declared range: " + ", ".join(f"`{t}`" for t in satisfying)
+              verdict = "Satisfying the declared range: " + ", ".join(f"`{t}`" for t in satisfying) + "."
           else:
               verdict = (
                   "**None of them satisfies it**, so a consumer must cut or install a binary "
@@ -287,7 +291,7 @@ jobs:
               f"declared as `>= {compat['minVersion']}, < {compat.get('maxExclusive')}` under SemVer",
               f"precedence. {compat['note']}",
               "",
-              f"Published releases checked against that range: {checked}. {verdict}.",
+              f"Published releases checked against that range: {checked}. {verdict}",
               "",
               "## Verify it yourself",
               "",
