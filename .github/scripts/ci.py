@@ -804,6 +804,23 @@ def configs_binary(path: str) -> str:
     return str(resolved)
 
 
+def stage_executable(path: str, work: Path) -> str:
+    """Copy the built binary into a consumer-style bin directory and return it.
+
+    Configuration discovery walks up from the executable first, so a binary left
+    in the build checkout resolves the checkout's own `orchestration/integrations.json`
+    and the run validates the checkout instead of the bundle under acceptance —
+    the exact false PASS the out-of-checkout `cwd` was meant to prevent. An
+    installed consumer has the binary in `<root>/bin` and the configuration in a
+    separate home, so the acceptance stages that same topology before probing.
+    """
+    source = Path(path)
+    target = work / "bin" / source.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    return str(target.resolve())
+
+
 def extract_configs_bundle(bundle: Path, target: Path) -> None:
     """Expand the bundle for a run, refusing anything but regular files with safe names."""
     target.mkdir(parents=True, exist_ok=False)
@@ -828,20 +845,21 @@ def configs_acceptance(args: argparse.Namespace) -> None:
     """Accept the release contract from a consumer's side.
 
     Three things have to hold at once: the extracted bundle is the configuration
-    the binary actually resolves (`orchestrate validate` names the manifest it
-    read), a normal-mode run on a representative repository completes with its
-    readable artifacts, and an evidence payload between the historical 8 MiB
-    default and the 64 MiB contract budget is admitted while one beyond the
-    budget is still refused.
+    the binary actually resolves (`orchestrate --action List` names the manifest
+    it read, and a home that is not a code-intel root resolves nothing), a
+    normal-mode run on a representative repository completes with its readable
+    artifacts, and an evidence payload between the historical 8 MiB default and
+    the 64 MiB contract budget is admitted while one beyond the budget is still
+    refused.
     """
     document = configs_document()
     compat = document["codeIntel"]
     verifier = configs_verifier()
     fixture = Path(args.fixture).resolve()
     request_template = read_json(fixture / "evidence-request.json")
-    executable = configs_binary(args.binary)
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
+    executable = stage_executable(configs_binary(args.binary), work)
     checks: list[dict[str, Any]] = []
     report: dict[str, Any] = {
         "schema": CONFIGS_ACCEPTANCE_SCHEMA,
@@ -914,15 +932,20 @@ def configs_acceptance(args: argparse.Namespace) -> None:
         # reported manifest path is asserted, not `ok`.
         _, resolved, _ = resolved_manifest(str(config_home))
         env["CODE_INTEL_HOME"] = str(config_home)
-        # Negative control: an empty home must be refused, which is what proves
-        # the variable is honoured rather than silently ignored.
+        # Negative control: a home that is not a code-intel root must leave the
+        # run with nothing to read. The staged binary cannot find a manifest by
+        # walking (neither its bin directory nor the acceptance work directory is
+        # a code-intel root), so CODE_INTEL_HOME is the only source left and an
+        # empty one has to fail instead of silently resolving something else.
         empty_home = work / "empty-home"
         empty_home.mkdir()
         empty_code, _, empty_stderr = resolved_manifest(str(empty_home))
         checks.append(
             {
                 "name": "configuration-home",
-                "ok": resolved == expected and empty_code != 0 and "does not contain" in empty_stderr,
+                "ok": resolved == expected
+                and empty_code != 0
+                and "orchestration/integrations.json" in empty_stderr,
                 "detail": (
                     f"resolved={resolved} expected={expected}; empty-home exit={empty_code} "
                     f"stderr={empty_stderr.strip()[:160]}"
@@ -947,6 +970,7 @@ def configs_acceptance(args: argparse.Namespace) -> None:
         text=True,
         env=env,
     )
+    (work / "normal-run.json").write_text(completed.stdout, encoding="utf-8")
     try:
         result = json.loads(completed.stdout)
     except json.JSONDecodeError:
@@ -959,9 +983,12 @@ def configs_acceptance(args: argparse.Namespace) -> None:
             and result.get("outcome") == "completed"
             and result.get("exitCode") == 0
             and result.get("failureNode") is None,
+            # The outcome alone never says which capability went unknown; name the
+            # failing nodes so a provider gap is one log read away.
             "detail": (
                 f"exit={completed.returncode} outcome={result.get('outcome')} "
-                f"failureNode={result.get('failureNode')} diagnostic={result.get('diagnostic')}"
+                f"failureNode={result.get('failureNode')} diagnostic={result.get('diagnostic')} "
+                f"failures={json.dumps(result.get('failures') or {})[:400]}"
             ),
         }
     )

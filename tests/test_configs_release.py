@@ -282,6 +282,26 @@ class AcceptancePathTests(unittest.TestCase):
             ci.configs_binary("target/release/does-not-exist")
         self.assertIn("code-intel binary missing", str(caught.exception))
 
+    def test_the_acceptance_stages_the_binary_outside_the_checkout(self) -> None:
+        # Configuration discovery walks up from the executable, so a binary left
+        # in the build checkout resolves the checkout's own manifest and the
+        # bundle under acceptance is never the configuration that gets read.
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            (checkout / "orchestration").mkdir(parents=True)
+            (checkout / "orchestration" / "integrations.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (checkout / "target" / "release").mkdir(parents=True)
+            built = checkout / "target" / "release" / "code-intel"
+            built.write_text("binary", encoding="utf-8")
+            work = Path(temporary) / "work"
+            work.mkdir()
+            staged = Path(ci.stage_executable(ci.configs_binary(str(built)), work))
+            self.assertTrue(staged.is_file())
+            self.assertEqual(staged.parent, (work / "bin").resolve())
+            self.assertEqual(staged.read_text(encoding="utf-8"), "binary")
+
 
 if __name__ == "__main__":
     unittest.main()
