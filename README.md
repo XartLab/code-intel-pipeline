@@ -249,6 +249,19 @@ sha256sum -c code-intel-pipeline-v0.7.0-linux.zip.sha256
 git verify-tag v0.7.0
 ```
 
+### 验证配置基线（`configs-v*`）
+
+配置面（`orchestration/`、`templates/`、`overlays/`、`skills/`、`pipeline.config*.json`）由独立的
+`configs-v*` 发布线认证，合同见 [docs/configs-release.md](docs/configs-release.md)。干净环境里一条命令：
+
+```bash
+python scripts/verify_configs_release.py --tag configs-v0.1.0 \
+    --dir "$(mktemp -d)" --code-intel "$(command -v code-intel)"
+```
+
+校验 tag→producer commit、每个资产与包内文件的 SHA-256、配置包与仓库该 commit 的逐文件一致性，
+并把 `code-intel --version` 对照 manifest 的兼容区间；区间外（例如仍带 8 MiB 缺陷的 `v0.7.1`）非零退出。
+
 ### 运行
 
 安装后直接使用编译入口；不需要 Cargo，也不依赖仓库里的 `target/`：
